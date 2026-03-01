@@ -1,0 +1,21 @@
+# Core
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
+
+# AI
+openai
+
+# MongoDB (Motor = async pymongo)
+motor
+pymongo
+
+# PDF
+PyPDF2
+
+# Email
+httpx
+
+# NLP / soft skills
+textblob
