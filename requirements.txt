@@ -1,21 +1,29 @@
 # Core
 fastapi
 uvicorn[standard]
-python-dotenv
-python-multipart
-
-# AI
-openai
-
-# MongoDB (Motor = async pymongo)
-motor
+motor               # async MongoDB driver
 pymongo
 
-# PDF
+# Auth (Feature 1)
+python-jose[cryptography]  # JWT encode/decode
+passlib[bcrypt]             # password hashing
+
+# AI / NLP
+openai
+python-dotenv
+
+# Soft skill analysis (Feature 8)
+textblob
+# Optional HuggingFace NLP (comment out if not needed):
+# transformers>=4.40.0
+# torch>=2.2.0
+
+# Media / File handling (Feature 3)
+python-multipart
 PyPDF2
 
-# Email
+# HTTP client (for Slack webhooks - Feature 7, and email)
 httpx
 
-# NLP / soft skills
-textblob
+# Validation
+pydantic[email]

@@ -1,22 +1,45 @@
 """
-AI service layer — professional prompt rewrite + timer-aware question generation.
-Updated: generate_questions_intro now accepts an optional candidate_name param
-         so the real name from the apply form is passed to the AI.
+AI service layer — supports multi-language interviews, custom questions,
+and resume-to-job screening (Feature: candidate fit assessment).
+
+New export:
+  screen_resume(job_title, job_description, resume_text) -> dict
+    Returns { is_fit: bool, reason: str, score: int }
 """
 
 import json
 import io
 import logging
+from typing import List, Optional
 
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
-log = logging.getLogger(__name__)
+log    = logging.getLogger(__name__)
 client = AsyncOpenAI()
 
+# Language code → full name mapping
+_LANGUAGE_NAMES = {
+    "en": "English",
+    "fr": "French",
+    "es": "Spanish",
+    "de": "German",
+    "pt": "Portuguese",
+    "ar": "Arabic",
+    "zh": "Chinese (Simplified)",
+    "hi": "Hindi",
+    "yo": "Yoruba",
+    "ha": "Hausa",
+    "ig": "Igbo",
+}
 
-# ── Shared interviewer persona (injected into every prompt) ───────────────────
+
+def _lang_name(code: str) -> str:
+    return _LANGUAGE_NAMES.get(code.lower(), code)
+
+
+# ── Shared interviewer persona ─────────────────────────────────────────────────
 _PERSONA = """
 You are Morgan, a senior technical interviewer at a world-class technology firm
 with 15 years of hiring experience across software engineering, product, and
@@ -30,63 +53,130 @@ Your interview style follows a structured arc:
                                    candidate and confirm their background.
   Phase 2 – Core technical     : progressively deeper questions tied to the
                                    job description and the candidate's actual
-                                   stated skills. Never ask about skills not on
-                                   the resume or in the JD.
-  Phase 3 – Behavioural        : one STAR-format situational question
-                                   (Situation / Task / Action / Result) drawn
-                                   from a real scenario the candidate would
-                                   face in this role.
-  Phase 4 – Wrap-up (optional) : if time permits, a forward-looking question
-                                   ("Where do you see this skill taking you?").
+                                   stated skills.
+  Phase 3 – Behavioural        : one STAR-format situational question.
+  Phase 4 – Wrap-up (optional) : if time permits, a forward-looking question.
 
 Tone rules:
   - Ask ONE question per turn. Never bundle two questions together.
   - Questions must be spoken-word natural — short, clear, no bullet points.
-  - Never start a question with "Certainly!", "Great!", "Sure!" or similar
-    filler affirmations. Get straight to the question.
+  - Never start a question with "Certainly!", "Great!", "Sure!" or similar fillers.
   - Reflect the candidate's last answer briefly before pivoting only when it
-    adds genuine value (e.g. "You mentioned X — let's dig into that.").
-    Otherwise go straight to the next question.
+    adds genuine value. Otherwise go straight to the next question.
 """.strip()
 
 
-# ── 1. Session initialisation ─────────────────────────────────────────────────
-async def generate_questions_intro(
+# ── 0. Resume screening (NEW) ─────────────────────────────────────────────────
+
+async def screen_resume(
     job_title:       str,
     job_description: str,
     resume_text:     str,
-    candidate_name:  str | None = None,   # ← NEW: real name from apply form
+) -> dict:
+    """
+    Assess how well a candidate's resume matches a job posting.
+
+    Returns:
+      {
+        "is_fit":  bool,   # True → invite to interview
+        "score":   int,    # 0-100 match score
+        "reason":  str,    # 1-2 sentence human-readable explanation
+      }
+
+    The threshold for is_fit is a score >= 60.
+    """
+    system_prompt = f"""
+You are an expert technical recruiter. Your task is to evaluate how well a
+candidate's resume matches a given job posting.
+
+Job Title:       {job_title}
+Job Description: {job_description}
+
+Candidate Resume:
+{resume_text}
+
+Evaluation criteria:
+  1. Required skills / technologies mentioned in the JD vs present in the resume.
+  2. Relevant work experience and seniority level.
+  3. Educational background where relevant.
+  4. Domain / industry alignment.
+
+Scoring:
+  - 80–100: Excellent match — candidate clearly meets most or all requirements.
+  - 60–79 : Good match — candidate meets the core requirements with minor gaps.
+  - 40–59 : Partial match — candidate has some relevant skills but significant gaps.
+  - 0–39  : Poor match — candidate does not meet the key requirements.
+
+A candidate is considered FIT (is_fit = true) if score >= 60.
+
+Return STRICT JSON — no markdown, no extra keys:
+{{
+  "score":  <integer 0-100>,
+  "is_fit": <true|false>,
+  "reason": "<1-2 concise, professional sentences explaining the decision>"
+}}
+""".strip()
+
+    resp = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system_prompt}],
+        temperature=0.2,
+    )
+    data = json.loads(resp.choices[0].message.content)
+
+    # Normalise types in case the model returns strings
+    score  = int(data.get("score", 0))
+    is_fit = bool(data.get("is_fit", score >= 60))
+    reason = str(data.get("reason", ""))
+    return {"score": score, "is_fit": is_fit, "reason": reason}
+
+
+# ── 1. Session initialisation ─────────────────────────────────────────────────
+
+async def generate_questions_intro(
+    job_title:        str,
+    job_description:  str,
+    resume_text:      str,
+    candidate_name:   Optional[str] = None,
+    language:         str           = "en",
+    custom_questions: List[str]     = [],
 ) -> dict:
     """
     Returns candidate_name, a spoken introText, and the first warm-up question.
-    Only Q1 is generated here; all subsequent questions are adaptive (per turn).
-    If candidate_name is supplied, the AI uses it directly and does not extract
-    from the resume (avoids mismatches).
+    Supports target language and injects recruiter custom questions into guidance.
     """
+    lang = _lang_name(language)
+
     name_instruction = (
-        f'Use "{candidate_name}" as the candidate name — do NOT try to extract it from the resume.'
+        f'Use "{candidate_name}" as the candidate name.'
         if candidate_name
         else 'Extract the candidate\'s full name from the resume. Fallback to "Candidate" if not found.'
     )
 
+    custom_q_section = ""
+    if custom_questions:
+        formatted = "\n".join(f"  - {q}" for q in custom_questions)
+        custom_q_section = f"""
+Custom questions from the recruiter (you MUST incorporate these somewhere during
+the interview — they can replace or supplement Phase 2/3 questions):
+{formatted}
+"""
+
     system_prompt = f"""
 {_PERSONA}
 
-You are about to start a live spoken interview. Your task right now is to:
-  1. {name_instruction}
-  2. Write a concise, warm spoken introduction (2-3 sentences MAX) that will
-     be read aloud by a text-to-speech engine. It must:
-       - Address the candidate by first name only.
-       - Name the role they are interviewing for.
-       - Set a professional but encouraging tone.
-       - NOT include any interviewer self-introduction — the candidate already
-         knows they are talking to an AI interviewer.
-  3. Write the very first interview question (Phase 1 – warm-up). It must be:
-       - Open-ended and easy.
-       - Directly tied to the candidate's background (e.g. "Tell me about your
-         most recent project with [technology from resume].").
-       - No longer than 2 sentences when spoken aloud.
+You are about to start a live spoken interview. All output MUST be written in {lang}.
 
+Your task right now is to:
+  1. {name_instruction}
+  2. Write a concise, warm spoken introduction (2-3 sentences MAX) in {lang} that:
+       - Addresses the candidate by first name only.
+       - Names the role they are interviewing for.
+       - Sets a professional but encouraging tone.
+  3. Write the very first interview question (Phase 1 – warm-up) in {lang}.
+     It must be open-ended, easy, and tied to the candidate's background.
+{custom_q_section}
 Candidate inputs:
   job_title:        {job_title}
   job_description:  {job_description}
@@ -110,43 +200,35 @@ Return STRICT JSON — no markdown, no extra keys:
 
 
 # ── 2. Adaptive next-question generation ──────────────────────────────────────
+
 async def generate_next_question(
-    job_title: str,
-    job_description: str,
-    resume_text: str,
+    job_title:            str,
+    job_description:      str,
+    resume_text:          str,
     conversation_history: list[dict],
-    question_number: int,
-    seconds_remaining: float,
+    question_number:      int,
+    seconds_remaining:    float,
+    language:             str       = "en",
+    custom_questions:     List[str] = [],
 ) -> str:
+    lang      = _lang_name(language)
     mins_left = seconds_remaining / 60
 
     if question_number == 1:
-        phase = "Phase 1 – Warm-up"
-        phase_guidance = (
-            "Ask the candidate to briefly walk you through their background "
-            "relevant to this role. Keep it open-ended."
-        )
+        phase          = "Phase 1 – Warm-up"
+        phase_guidance = "Ask the candidate to briefly walk you through their background relevant to this role."
     elif mins_left > 10:
-        phase = "Phase 2 – Core Technical"
+        phase          = "Phase 2 – Core Technical"
         phase_guidance = (
             "Go deeper on a technical skill from the resume or JD. "
-            "Build directly on the candidate's last answer — probe a gap if "
-            "the answer was vague, or escalate difficulty if it was strong."
+            "Build directly on the candidate's last answer."
         )
     elif mins_left > 4:
-        phase = "Phase 3 – Behavioural"
-        phase_guidance = (
-            "Ask ONE behavioural question in STAR format relevant to this role. "
-            "Example: 'Tell me about a time when you had to [scenario].' "
-            f"Choose a scenario that a {job_title} would genuinely face."
-        )
+        phase          = "Phase 3 – Behavioural"
+        phase_guidance = f"Ask ONE behavioural question in STAR format relevant to a {job_title}."
     else:
-        phase = "Phase 4 – Wrap-up"
-        phase_guidance = (
-            "Ask a short forward-looking or reflective question. "
-            f"Example: 'What's one area of {job_title} work you're actively "
-            "trying to level up in?' Keep it light — we're near the end."
-        )
+        phase          = "Phase 4 – Wrap-up"
+        phase_guidance = "Ask a short forward-looking or reflective question."
 
     history_lines = []
     for i, turn in enumerate(conversation_history):
@@ -154,11 +236,23 @@ async def generate_next_question(
         history_lines.append(f"Q{i+1}: {turn['question']}\nA{i+1}: {ans}")
     history_text = "\n\n".join(history_lines) if history_lines else "(none yet)"
 
+    custom_q_section = ""
+    if custom_questions:
+        asked   = [t["question"] for t in conversation_history]
+        pending = [q for q in custom_questions if q not in asked]
+        if pending:
+            formatted = "\n".join(f"  - {q}" for q in pending)
+            custom_q_section = f"""
+IMPORTANT — Pending recruiter custom questions (ask these if they fit the current phase):
+{formatted}
+"""
+
     system_prompt = f"""
 {_PERSONA}
 
-You are mid-interview. Here is the full context:
+All output MUST be written in {lang}.
 
+You are mid-interview. Here is the full context:
   Role:             {job_title}
   Job description:  {job_description}
   Candidate resume: {resume_text}
@@ -173,20 +267,13 @@ Current state:
 
 Phase guidance:
 {phase_guidance}
-
-Your task: generate the next single interview question.
+{custom_q_section}
+Your task: generate the next single interview question in {lang}.
 
 Strict rules:
   - ONE question only. No preamble, no affirmations, no filler phrases.
-  - It must follow naturally from the candidate's last answer.
-    • If the last answer was strong → escalate depth or move to the next phase.
-    • If the last answer was vague or incomplete → ask a precise follow-up.
-    • If the candidate skipped → pivot to a distinct but related topic from
-      the JD or resume without drawing attention to the skip.
   - Never repeat or closely paraphrase a previous question.
   - Max 2 sentences when spoken aloud.
-  - Do NOT ask about technologies or experiences NOT mentioned in the resume
-    or job description.
 
 Return STRICT JSON — no markdown:
 {{"question": "string"}}
@@ -202,22 +289,34 @@ Return STRICT JSON — no markdown:
     return data.get("question", "").strip()
 
 
-# ── 3. Whisper transcription ──────────────────────────────────────────────────
-async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
+# ── 3. Whisper transcription (language-aware) ─────────────────────────────────
+
+async def transcribe_audio(
+    audio_bytes: bytes,
+    filename:    str = "audio.webm",
+    language:    str = "en",
+) -> str:
     audio_file      = io.BytesIO(audio_bytes)
     audio_file.name = filename
 
     transcription = await client.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_file,
-        language="en",
-        response_format="text",
+        model           = "whisper-1",
+        file            = audio_file,
+        language        = language if language != "auto" else None,
+        response_format = "text",
     )
     return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
 
 
-# ── 4. Enhanced report ────────────────────────────────────────────────────────
-async def generate_report(answers: list, duration_minutes: int = 30) -> dict:
+# ── 4. Enhanced report generation ─────────────────────────────────────────────
+
+async def generate_report(
+    answers:          list,
+    duration_minutes: int  = 30,
+    language:         str  = "en",
+    nlp_metrics:      dict = None,
+) -> dict:
+    lang          = _lang_name(language)
     total         = len(answers)
     total_fillers = sum(a.get("filler_word_count", 0) for a in answers)
     all_fillers   = [f for a in answers for f in a.get("filler_words_found", [])]
@@ -225,18 +324,29 @@ async def generate_report(answers: list, duration_minutes: int = 30) -> dict:
     sentiment_counts  = {"positive": 0, "neutral": 0, "negative": 0}
     confidence_counts = {"high": 0, "medium": 0, "low": 0}
     for a in answers:
-        sentiment_counts [a.get("sentiment",       "neutral")] += 1
-        confidence_counts[a.get("confidence_level","medium")]  += 1
+        sentiment_counts [a.get("sentiment",        "neutral")] += 1
+        confidence_counts[a.get("confidence_level", "medium")]  += 1
 
     avg_sentiment = sum(a.get("sentiment_score", 0.0) for a in answers) / max(total, 1)
     skipped       = sum(1 for a in answers if a.get("skip"))
     answered      = total - skipped
 
+    nlp_section = ""
+    if nlp_metrics:
+        nlp_section = f"""
+─── NLP Soft-Skill Metrics (Hugging Face) ────────────────────────────────────
+  Leadership score   : {nlp_metrics.get('leadership_score', 'N/A')}
+  Teamwork score     : {nlp_metrics.get('teamwork_score', 'N/A')}
+  Problem-solving    : {nlp_metrics.get('problem_solving_score', 'N/A')}
+  Communication cues : {nlp_metrics.get('communication_cues', [])}
+  Key phrases        : {nlp_metrics.get('key_phrases', [])}
+"""
+
     system_prompt = f"""
 {_PERSONA}
 
-The interview has concluded. Your task is to produce a fair, detailed, and
-actionable evaluation report for the candidate and their hiring manager.
+The interview has concluded. Produce a detailed evaluation report.
+Report language: {lang} (write ALL text fields in {lang}).
 
 ─── Interview metadata ───────────────────────────────────────────────────────
   Scheduled duration : {duration_minutes} minutes
@@ -248,34 +358,18 @@ actionable evaluation report for the candidate and their hiring manager.
 {json.dumps(answers, indent=2, default=str)}
 
 ─── Pre-computed soft-skill metrics ─────────────────────────────────────────
-  Total filler words        : {total_fillers}
-  Unique fillers used       : {list(set(all_fillers))[:10]}
-  Sentiment distribution    : {sentiment_counts}
-  Avg sentiment score       : {avg_sentiment:.2f}  (−1 = very negative, +1 = very positive)
-  Confidence distribution   : {confidence_counts}
-
+  Total filler words     : {total_fillers}
+  Unique fillers used    : {list(set(all_fillers))[:10]}
+  Sentiment distribution : {sentiment_counts}
+  Avg sentiment score    : {avg_sentiment:.2f}
+  Confidence distribution: {confidence_counts}
+{nlp_section}
 ─── Evaluation rubric ────────────────────────────────────────────────────────
-Technical scoring:
-  - An answer is "correct" if the candidate covered ≥ 70% of the expected key
-    concepts for that question given the role and JD. Be fair but honest.
-  - A skipped question always scores 0.
-  - Score = (correct answers / total questions) × 100, expressed as "XX%".
-
-Soft-skill scoring:
-  communication_score: holistic score (0-100%) weighing clarity, structure,
-    use of concrete examples, and absence of excessive filler words.
-  filler_word_usage  : "low" (<5 total), "moderate" (5-15), "high" (>15).
-  overall_sentiment  : dominant label from the distribution above.
-  confidence         : dominant label from the distribution above.
-
-Improvement areas: max 5 bullet points. Be specific — name the actual concept
-  or skill gap, not generic advice like "study more".
-
-Coaching tips (soft skills): max 3, each 1 sentence, immediately actionable.
-
-Hiring recommendation:
-  "strong_yes" | "yes" | "maybe" | "no"
-  Base this on technical score + communication quality + engagement level.
+  score: (correct answers / total questions) × 100
+  communication_score: clarity, structure, examples, filler usage
+  filler_word_usage: "low" (<5), "moderate" (5-15), "high" (>15)
+  hiring_recommendation: "strong_yes" | "yes" | "maybe" | "no"
+  nlp_metrics: include leadership_score, teamwork_score (0-100) if available.
 
 Return STRICT JSON — no markdown, no extra keys:
 {{
@@ -290,7 +384,13 @@ Return STRICT JSON — no markdown, no extra keys:
     "overall_sentiment":   "positive | neutral | negative",
     "confidence":          "high | medium | low",
     "top_fillers":         ["um", "like"],
-    "coaching_tips":       ["...", "...", "..."]
+    "coaching_tips":       ["...", "...", "..."],
+    "nlp_metrics": {{
+      "leadership_score":      <0-100 or null>,
+      "teamwork_score":        <0-100 or null>,
+      "problem_solving_score": <0-100 or null>,
+      "key_phrases":           ["..."]
+    }}
   }}
 }}
 """.strip()

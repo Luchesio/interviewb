@@ -1,77 +1,133 @@
 """
-Email service — sends interview invite emails.
+Email service — sends all platform emails.
 
-Set one of the following ENV vars:
+ENV vars:
   RESEND_API_KEY   – use Resend (preferred)
   SENDGRID_API_KEY – use SendGrid (fallback)
   EMAIL_FROM       – sender address (default: noreply@yourdomain.com)
   APP_BASE_URL     – public URL of the frontend (default: http://localhost:4200)
 
-If neither key is set the email is only logged (useful in local dev).
+Gmail desktop clips emails over ~102 KB. Each builder uses only the CSS it
+actually needs (no shared mega-block) and all style strings are minified to
+keep every email well under that threshold.
 """
 
+import asyncio
 import os
 import logging
 import httpx
 
 log = logging.getLogger(__name__)
 
-RESEND_API_KEY    = os.getenv("RESEND_API_KEY", "")
-SENDGRID_API_KEY  = os.getenv("SENDGRID_API_KEY", "")
-EMAIL_FROM        = os.getenv("EMAIL_FROM", "noreply@yourdomain.com")
-APP_BASE_URL      = os.getenv("APP_BASE_URL", "http://localhost:4200")
+RESEND_API_KEY   = os.getenv("RESEND_API_KEY", "")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+EMAIL_FROM       = os.getenv("EMAIL_FROM", "noreply@yourdomain.com")
+APP_BASE_URL     = os.getenv("APP_BASE_URL", "http://localhost:4200")
+
+# ---------------------------------------------------------------------------
+# Minified CSS — Ingenium design system (navy #0F213A · gold #C5A059 · white)
+# Two lean blocks: one for candidate emails, one for the recruiter report.
+# Both kept well under the 102 KB Gmail desktop clip threshold.
+# ---------------------------------------------------------------------------
+
+# Candidate emails (invite + fit/no-fit)
+_CSS_CANDIDATE = (
+    "body{margin:0;padding:0;background:#F4F6F8;font-family:Arial,sans-serif;color:#2C3E50}"
+    ".w{max-width:560px;margin:32px auto;background:#fff;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden}"
+    ".hd{background:#0F213A;padding:28px 36px;border-bottom:3px solid #C5A059}"
+    ".hd h1{margin:0;font-size:1.1rem;font-weight:700;color:#fff;letter-spacing:.03em}"
+    ".hd .tag{font-size:.7rem;color:#C5A059;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}"
+    ".bd{padding:28px 36px;background:#fff}"
+    ".bd p{color:#2C3E50;font-size:.93rem;line-height:1.75;margin:0 0 14px}"
+    ".bd strong{color:#0F213A}"
+    ".btn{display:inline-block;padding:12px 28px;background:#0F213A;color:#C5A059;"
+    "font-weight:700;font-size:.9rem;border-radius:8px;text-decoration:none;"
+    "margin:6px 0 18px;border:2px solid #C5A059}"
+    ".note{font-size:.79rem;color:#6C7A89}"
+    ".note a{color:#1A365D}"
+    ".ft{padding:16px 36px;background:#F4F6F8;border-top:1px solid #E2E8F0;"
+    "font-size:.74rem;color:#6C7A89;text-align:center}"
+)
+
+# Recruiter report email — includes tables, badges, lists
+_CSS_RECRUITER = (
+    "body{margin:0;padding:0;background:#F4F6F8;font-family:Arial,sans-serif;color:#2C3E50}"
+    ".w{max-width:600px;margin:32px auto;background:#fff;border:1px solid #E2E8F0;border-radius:10px;overflow:hidden}"
+    ".hd{background:#0F213A;padding:26px 36px;border-bottom:3px solid #C5A059}"
+    ".hd h1{margin:0;font-size:1.05rem;font-weight:700;color:#fff;letter-spacing:.03em}"
+    ".bd{padding:24px 36px;background:#fff}"
+    ".bd p{color:#2C3E50;font-size:.9rem;line-height:1.7;margin:0 0 12px}"
+    ".bd strong{color:#0F213A}"
+    "table{width:100%;border-collapse:collapse;margin-bottom:16px}"
+    "th{background:#0F213A;color:#C5A059;font-size:.72rem;text-transform:uppercase;"
+    "letter-spacing:.05em;padding:8px 10px;text-align:left}"
+    "td{padding:7px 10px;font-size:.85rem;color:#2C3E50;border-bottom:1px solid #E2E8F0}"
+    ".badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:.74rem;font-weight:700}"
+    ".sy{background:#EDFAF3;color:#2E7D52}"
+    ".y{background:#EFF6FF;color:#2563EB}"
+    ".mb{background:#FFFBEB;color:#B7791F}"
+    ".no{background:#FEF2F2;color:#C0392B}"
+    ".lbl{margin:0 0 4px;color:#6C7A89;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}"
+    "ul{padding-left:16px;margin:0 0 14px}"
+    "li{color:#2C3E50;font-size:.84rem;margin-bottom:5px;line-height:1.5}"
+    ".btn{display:inline-block;padding:11px 26px;background:#0F213A;color:#C5A059;"
+    "font-weight:700;font-size:.88rem;border-radius:8px;text-decoration:none;"
+    "margin:4px 0 14px;border:2px solid #C5A059}"
+    ".note{font-size:.77rem;color:#6C7A89}"
+    ".note a{color:#1A365D}"
+    ".ft{padding:14px 36px;background:#F4F6F8;border-top:1px solid #E2E8F0;"
+    "font-size:.72rem;color:#6C7A89;text-align:center}"
+    "code{background:#F4F6F8;color:#0F213A;padding:1px 5px;border-radius:4px;font-size:.75rem}"
+)
 
 
-def _build_html(candidate_name: str, job_title: str, verify_url: str) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Your Interview Invitation</title>
-  <style>
-    body {{ margin:0; padding:0; background:#0d0d0f; font-family:'Segoe UI',Arial,sans-serif; color:#fff; }}
-    .wrapper {{ max-width:560px; margin:40px auto; background:rgba(255,255,255,0.04);
-                border:1px solid rgba(255,255,255,0.08); border-radius:16px; overflow:hidden; }}
-    .header  {{ background:linear-gradient(135deg,#4f9cf9 0%,#7b6ef6 100%); padding:36px 40px; }}
-    .header h1 {{ margin:0; font-size:1.5rem; font-weight:700; color:#fff; }}
-    .body    {{ padding:36px 40px; }}
-    .body p  {{ color:rgba(255,255,255,0.75); font-size:0.95rem; line-height:1.7; margin:0 0 18px; }}
-    .btn     {{ display:inline-block; padding:14px 32px; background:linear-gradient(135deg,#4f9cf9,#7b6ef6);
-                color:#fff; font-weight:700; font-size:0.95rem; border-radius:10px;
-                text-decoration:none; margin:8px 0 24px; }}
-    .note    {{ font-size:0.82rem; color:rgba(255,255,255,0.4); }}
-    .footer  {{ padding:20px 40px; border-top:1px solid rgba(255,255,255,0.06);
-                font-size:0.78rem; color:rgba(255,255,255,0.3); text-align:center; }}
-  </style>
-</head>
-<body>
-  <div class="wrapper">
-    <div class="header">
-      <h1>🤖 AI Interview Invitation</h1>
-    </div>
-    <div class="body">
-      <p>Hi <strong>{candidate_name}</strong>,</p>
-      <p>
-        You have been invited to complete an AI-powered interview for the
-        <strong>{job_title}</strong> position. The interview is conducted by
-        our AI interviewer and takes approximately 15–20 minutes.
-      </p>
-      <p>Click the button below to begin. The link is valid for <strong>72 hours</strong>.</p>
-      <a class="btn" href="{verify_url}">Start My Interview →</a>
-      <p class="note">
-        If the button doesn't work, paste this link into your browser:<br/>
-        <a href="{verify_url}" style="color:#7db8fc;">{verify_url}</a>
-      </p>
-      <p class="note">This link can only be used once and will expire after 72 hours.</p>
-    </div>
-    <div class="footer">
-      You are receiving this email because you applied for {job_title}.<br/>
-      If you did not apply, please disregard this email.
-    </div>
-  </div>
-</body>
-</html>"""
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _first(name: str) -> str:
+    """Return just the first name for a friendlier greeting."""
+    return name.split()[0] if name else name
+
+
+def _badge_html(rec: str) -> str:
+    cls   = {"strong_yes": "sy", "yes": "y", "maybe": "mb", "no": "no"}.get(rec, "")
+    label = {"strong_yes": "Strong Yes ✅", "yes": "Yes ✓",
+             "maybe": "Maybe ⚠️", "no": "No ✗"}.get(rec, rec)
+    return f'<span class="badge {cls}">{label}</span>'
+
+
+# ── 1. Interview invite (candidate) ──────────────────────────────────────────
+
+def _build_invite_html(candidate_name: str, job_title: str, verify_url: str) -> str:
+    fn = _first(candidate_name)
+    return (
+        f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        f'<style>{_CSS_CANDIDATE}</style></head><body>'
+        f'<div class="w">'
+        f'<div class="hd">'
+        f'<div class="tag">Ingenium &mdash; Recruitment</div>'
+        f'<h1>Interview Invitation &mdash; {job_title}</h1>'
+        f'</div>'
+        f'<div class="bd">'
+        f'<p>Dear <strong>{fn}</strong>,</p>'
+        f'<p>Thank you for your application for the <strong>{job_title}</strong> position. '
+        f'We are pleased to invite you to the next stage of our recruitment process.</p>'
+        f'<p>Please complete the short structured interview at your earliest convenience. '
+        f'It takes approximately 15&ndash;20 minutes and can be completed from anywhere &mdash; '
+        f'all you need is a quiet space and a working microphone.</p>'
+        f'<p>Your interview link is valid for <strong>72 hours</strong>. '
+        f'Please use it at a time when you can give it your full attention.</p>'
+        f'<a class="btn" href="{verify_url}">Begin Your Interview &rarr;</a>'
+        f'<p class="note">Button not working? Copy and paste this link into your browser:<br>'
+        f'<a href="{verify_url}">{verify_url}</a></p>'
+        f'<p class="note">This link is personal to you, single-use, and expires in 72 hours.</p>'
+        f'<p>Should you have any questions, please reply to this email. '
+        f'We wish you the very best of luck!</p>'
+        f'<p>Kind regards,<br><strong>The Ingenium Recruitment Team</strong></p>'
+        f'</div>'
+        f'<div class="ft">You received this because you applied for the {job_title} position.'
+        f' If this was not you, please disregard this email.</div>'
+        f'</div></body></html>'
+    )
 
 
 async def send_interview_invite(
@@ -80,72 +136,275 @@ async def send_interview_invite(
     job_title:      str,
     token:          str,
 ) -> bool:
-    """
-    Send an interview invitation email.
-    Returns True on success, False on failure.
-    """
     verify_url = f"{APP_BASE_URL}/interview/verify?token={token}"
-    subject    = f"Your interview invitation: {job_title}"
-    html_body  = _build_html(candidate_name, job_title, verify_url)
+    subject    = f"Your Interview Invitation — {job_title}"
+    return await _dispatch(to_email, subject,
+                           _build_invite_html(candidate_name, job_title, verify_url),
+                           dev_label=f"invite → {to_email}")
 
-    if RESEND_API_KEY:
-        return await _send_via_resend(to_email, subject, html_body)
-    if SENDGRID_API_KEY:
-        return await _send_via_sendgrid(to_email, subject, html_body)
 
-    # Local dev fallback — just log
-    log.warning(
-        "[EMAIL DEV] Would send to %s\n  Subject : %s\n  Verify  : %s",
-        to_email, subject, verify_url,
+# ── 2. Candidate fit / no-fit email ──────────────────────────────────────────
+
+def _build_fit_html(candidate_name: str, job_title: str,
+                    is_fit: bool, verify_url: str | None) -> str:
+    fn = _first(candidate_name)
+
+    if is_fit:
+        headline = f"Application Update &mdash; {job_title}"
+        body = (
+            f'<p>Dear <strong>{fn}</strong>,</p>'
+            f'<p>Thank you for your application for the <strong>{job_title}</strong> position. '
+            f'We have reviewed your application and are pleased to inform you that you have been '
+            f'selected to proceed to the next stage of our recruitment process.</p>'
+            f'<p>As part of this stage, we would like you to complete a short structured interview '
+            f'at your earliest convenience. It takes approximately 15&ndash;20 minutes and can be '
+            f'completed from anywhere &mdash; all you need is a quiet space and a working microphone.</p>'
+            f'<p>Your interview link is valid for <strong>72 hours</strong>. '
+            f'Please ensure you use it at a time when you are able to give it your full attention.</p>'
+            f'<a class="btn" href="{verify_url}">Begin Your Interview &rarr;</a>'
+            f'<p class="note">Button not working? Copy and paste this link into your browser:<br>'
+            f'<a href="{verify_url}">{verify_url}</a></p>'
+            f'<p class="note">This link is personal to you, single-use, and expires in 72 hours.</p>'
+            f'<p>Should you have any questions or require any adjustments, '
+            f'please do not hesitate to reply to this email.</p>'
+            f'<p>We wish you the very best of luck!</p>'
+            f'<p>Kind regards,<br><strong>The Ingenium Recruitment Team</strong></p>'
+        )
+        footer = f"You received this because your application for the {job_title} position was progressed."
+
+    else:
+        headline = f"Your Application &mdash; {job_title}"
+        body = (
+            f'<p>Dear <strong>{fn}</strong>,</p>'
+            f'<p>Thank you for taking the time to apply for the <strong>{job_title}</strong> role '
+            f'and for the interest you have shown in joining our team.</p>'
+            f'<p>After carefully reviewing all applications received, we regret to inform you that '
+            f'we will not be progressing with your application on this occasion. '
+            f'Please be assured that this decision was not taken lightly, and we appreciate '
+            f'the effort you put into your application.</p>'
+            f'<p>We would encourage you to continue to follow our openings, as we regularly '
+            f'post new roles that may be an excellent fit for your skills and experience.</p>'
+            f'<p>We wish you every success with your job search and future career.</p>'
+            f'<p>Kind regards,<br><strong>The Ingenium Recruitment Team</strong></p>'
+        )
+        footer = f"You received this because you applied for the {job_title} position."
+
+    return (
+        f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        f'<style>{_CSS_CANDIDATE}</style></head><body>'
+        f'<div class="w">'
+        f'<div class="hd">'
+        f'<div class="tag">Ingenium &mdash; Recruitment</div>'
+        f'<h1>{headline}</h1>'
+        f'</div>'
+        f'<div class="bd">{body}</div>'
+        f'<div class="ft">{footer}</div>'
+        f'</div></body></html>'
     )
+
+
+async def send_candidate_fit_email(
+    to_email:       str,
+    candidate_name: str,
+    job_title:      str,
+    is_fit:         bool,
+    token:          str | None = None,
+) -> bool:
+    """
+    Send a fit/no-fit email to the candidate.
+
+    - is_fit=True  → professional shortlist email with the interview link.
+    - is_fit=False → warm, professional rejection email.
+
+    Reads as if written by a human recruiter. No AI analysis, screening scores,
+    match percentages, gap analysis, or mention of automated screening appears
+    anywhere — that information goes to the recruiter report only.
+    """
+    verify_url = (f"{APP_BASE_URL}/interview/verify?token={token}"
+                  if (is_fit and token) else None)
+    subject = (f"You Have Been Shortlisted — {job_title}"
+               if is_fit else f"Your Application for {job_title}")
+    return await _dispatch(
+        to_email, subject,
+        _build_fit_html(candidate_name, job_title, is_fit, verify_url),
+        dev_label=f"fit_email(is_fit={is_fit}) → {to_email}",
+    )
+
+
+# ── 3. Recruiter report email ─────────────────────────────────────────────────
+
+def _build_report_html(
+    recruiter_name: str,
+    candidate_name: str,
+    job_title:      str,
+    report:         dict,
+    report_id:      str,
+    job_id:         str,
+) -> str:
+    rec        = report.get("hiring_recommendation", "")
+    score      = report.get("score", "N/A")
+    reason     = report.get("recommendation_reason", "")
+    soft       = report.get("soft_skills", {})
+    comm_score = soft.get("communication_score", "N/A")
+    confidence = soft.get("confidence", "N/A")
+    sentiment  = soft.get("overall_sentiment", "N/A")
+    filler_use = soft.get("filler_word_usage", "N/A")
+    tips       = soft.get("coaching_tips", [])
+    gaps       = report.get("improvment_area", [])
+    nlp        = soft.get("nlp_metrics", {})
+
+    report_url = f"{APP_BASE_URL}/recruiter/reports/{report_id}"
+    tips_html  = "".join(f"<li>{t}</li>" for t in tips) if tips else "<li>N/A</li>"
+    gaps_html  = "".join(f"<li>{g}</li>" for g in gaps) if gaps else "<li>None identified</li>"
+
+    nlp_rows = ""
+    if nlp:
+        nlp_rows = (
+            f'<tr><td>Leadership</td><td>{nlp.get("leadership_score", "N/A")}</td></tr>'
+            f'<tr><td>Teamwork</td><td>{nlp.get("teamwork_score", "N/A")}</td></tr>'
+            f'<tr><td>Problem-Solving</td><td>{nlp.get("problem_solving_score", "N/A")}</td></tr>'
+        )
+
+    fn = _first(recruiter_name)
+
+    return (
+        f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        f'<style>{_CSS_RECRUITER}</style></head><body>'
+        f'<div class="w">'
+        f'<div class="hd">'
+        f'<div style="font-size:.68rem;color:#C5A059;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px">Ingenium &mdash; Interview Report</div>'
+        f'<h1>{candidate_name} &mdash; {job_title}</h1>'
+        f'</div>'
+        f'<div class="bd">'
+        f'<p>Dear <strong>{fn}</strong>,</p>'
+        f'<p>The AI-assisted interview for <strong>{candidate_name}</strong> applying for the '
+        f'<strong>{job_title}</strong> role has been completed. Please find the full evaluation summary below.</p>'
+
+        f'<table><thead><tr><th colspan="2">Overall Assessment</th></tr></thead><tbody>'
+        f'<tr><td>Recommendation</td><td>{_badge_html(rec)}</td></tr>'
+        f'<tr><td>Technical Score</td><td><strong>{score}</strong></td></tr>'
+        f'<tr><td>Rationale</td><td>{reason}</td></tr>'
+        f'</tbody></table>'
+
+        f'<table><thead><tr><th colspan="2">Soft Skills</th></tr></thead><tbody>'
+        f'<tr><td>Communication Score</td><td>{comm_score}</td></tr>'
+        f'<tr><td>Confidence Level</td><td>{confidence}</td></tr>'
+        f'<tr><td>Overall Sentiment</td><td>{sentiment}</td></tr>'
+        f'<tr><td>Filler Word Usage</td><td>{filler_use}</td></tr>'
+        f'{nlp_rows}'
+        f'</tbody></table>'
+
+        f'<p class="lbl">Areas for Improvement</p><ul>{gaps_html}</ul>'
+        f'<p class="lbl">Coaching Tips for Candidate</p><ul>{tips_html}</ul>'
+
+        f'<a class="btn" href="{report_url}">View Full Report &rarr;</a>'
+        f'<p class="note">Direct link: <a href="{report_url}">{report_url}</a></p>'
+        f'<p>Kind regards,<br><strong>The Ingenium Platform</strong></p>'
+        f'</div>'
+        f'<div class="ft">'
+        f'Ingenium AI Interview Platform &nbsp;&bull;&nbsp; '
+        f'Job ID: <code>{job_id}</code> &nbsp;&bull;&nbsp; Report ID: <code>{report_id}</code>'
+        f'</div>'
+        f'</div></body></html>'
+    )
+
+
+async def send_report_to_recruiter(
+    to_email:       str,
+    recruiter_name: str,
+    candidate_name: str,
+    job_title:      str,
+    report:         dict,
+    report_id:      str,
+    job_id:         str,
+) -> bool:
+    """Email the full interview report to the recruiter who owns the job."""
+    subject = f"Interview Report: {candidate_name} — {job_title}"
+    return await _dispatch(
+        to_email, subject,
+        _build_report_html(recruiter_name, candidate_name,
+                           job_title, report, report_id, job_id),
+        dev_label=f"recruiter_report → {to_email} | candidate={candidate_name}",
+    )
+
+
+# ── Retry helper ──────────────────────────────────────────────────────────────
+
+# Exponential backoff: attempt 1 → wait 30s, attempt 2 → wait 60s, attempt 3 → wait 120s
+_RETRY_DELAYS = [30, 60, 120]   # seconds between attempts (3 retries = 4 total attempts)
+
+
+async def _with_retry(fn, label: str) -> bool:
+    """
+    Call an async send function up to 4 times (1 initial + 3 retries) with
+    exponential backoff. Returns True as soon as one attempt succeeds.
+    A transient ConnectError (e.g. momentary network drop) will not lose the email.
+    """
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
+        if delay:
+            log.warning("[EMAIL] attempt %d for %s — retrying in %ds", attempt, label, delay)
+            await asyncio.sleep(delay)
+        try:
+            success = await fn()
+            if success:
+                if attempt > 1:
+                    log.info("[EMAIL] delivered on attempt %d for %s", attempt, label)
+                return True
+        except Exception as exc:
+            log.warning("[EMAIL] attempt %d error for %s: %s", attempt, label, exc)
+
+    log.error("[EMAIL] all %d attempts failed for %s", len(_RETRY_DELAYS) + 1, label)
+    return False
+
+
+# ── Internal send dispatcher ──────────────────────────────────────────────────
+
+async def _dispatch(to: str, subject: str, html: str, dev_label: str = "") -> bool:
+    if RESEND_API_KEY:
+        return await _with_retry(lambda: _send_via_resend(to, subject, html),
+                                 label=f"resend→{to}")
+    if SENDGRID_API_KEY:
+        return await _with_retry(lambda: _send_via_sendgrid(to, subject, html),
+                                 label=f"sendgrid→{to}")
+    log.warning("[EMAIL DEV] %s | Subject: %s", dev_label, subject)
     return True
 
 
 async def _send_via_resend(to: str, subject: str, html: str) -> bool:
-    payload = {
-        "from":    EMAIL_FROM,
-        "to":      [to],
-        "subject": subject,
-        "html":    html,
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=10,
-            )
-        if resp.status_code in (200, 201):
-            log.info("Resend: email sent to %s", to)
-            return True
-        log.error("Resend error %s: %s", resp.status_code, resp.text)
-        return False
-    except Exception as exc:
-        log.exception("Resend exception: %s", exc)
-        return False
+    payload = {"from": EMAIL_FROM, "to": [to], "subject": subject, "html": html}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+    if resp.status_code in (200, 201):
+        log.info("Resend: sent to %s", to)
+        return True
+    # 429 = rate limited, 5xx = server error — both worth retrying
+    log.error("Resend HTTP %s for %s: %s", resp.status_code, to, resp.text[:200])
+    return False
 
 
 async def _send_via_sendgrid(to: str, subject: str, html: str) -> bool:
     payload = {
         "personalizations": [{"to": [{"email": to}]}],
-        "from":             {"email": EMAIL_FROM},
-        "subject":          subject,
-        "content":          [{"type": "text/html", "value": html}],
+        "from":    {"email": EMAIL_FROM},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
     }
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=10,
-            )
-        if resp.status_code == 202:
-            log.info("SendGrid: email sent to %s", to)
-            return True
-        log.error("SendGrid error %s: %s", resp.status_code, resp.text)
-        return False
-    except Exception as exc:
-        log.exception("SendGrid exception: %s", exc)
-        return False
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+    if resp.status_code == 202:
+        log.info("SendGrid: sent to %s", to)
+        return True
+    log.error("SendGrid HTTP %s for %s: %s", resp.status_code, to, resp.text[:200])
+    return False

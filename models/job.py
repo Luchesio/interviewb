@@ -5,7 +5,7 @@ All stored via Motor (async pymongo).
 
 from __future__ import annotations
 from enum import Enum
-from typing import Optional, Any
+from typing import Optional, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -13,21 +13,23 @@ from datetime import datetime
 # ── Job ───────────────────────────────────────────────────────────────────────
 
 class Job(BaseModel):
-    job_id:          str
-    recruiter_id:    str = "default"          # extend when auth is added
-    job_title:       str
-    job_description: str
-    created_at:      datetime = Field(default_factory=datetime.utcnow)
-    is_active:       bool = True
+    job_id:           str
+    recruiter_id:     str
+    job_title:        str
+    job_description:  str
+    custom_questions: List[str] = Field(default_factory=list)  # Feature 4
+    created_at:       datetime  = Field(default_factory=datetime.utcnow)
+    is_active:        bool      = True
 
 
 # ── Application ───────────────────────────────────────────────────────────────
 
 class ApplicationStatus(str, Enum):
     PENDING   = "pending"
-    INVITED   = "invited"   # email sent
-    STARTED   = "started"   # verify endpoint hit
+    INVITED   = "invited"
+    STARTED   = "started"
     COMPLETED = "completed"
+    REJECTED  = "rejected"   # Added: candidate did not pass resume screening
 
 
 class Application(BaseModel):
@@ -36,8 +38,9 @@ class Application(BaseModel):
     candidate_name:  str
     candidate_email: str
     resume_text:     str
-    session_id:      Optional[str] = None   # set when interview is created
+    session_id:      Optional[str] = None
     status:          ApplicationStatus = ApplicationStatus.PENDING
+    language:        str = "en"                     # Feature 6
     created_at:      datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -48,7 +51,7 @@ class InterviewToken(BaseModel):
     application_id: str
     job_id:         str
     session_id:     str
-    expires_at:     datetime       # 72-hour TTL; MongoDB TTL index on this field
+    expires_at:     datetime
     used:           bool = False
 
 
@@ -61,5 +64,19 @@ class StoredReport(BaseModel):
     job_id:          str
     candidate_name:  str
     candidate_email: str
-    report:          dict[str, Any]   # raw JSON from generate_report()
+    report:          dict[str, Any]
+    media_id:        Optional[str]  = None   # Feature 3: linked recording
+    media_type:      Optional[str]  = None
     created_at:      datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Recruiter user account ────────────────────────────────────────────────────
+
+class RecruiterUser(BaseModel):
+    user_id:           str
+    email:             str
+    name:              str = ""
+    hashed_password:   str
+    role:              str = "recruiter"
+    slack_webhook_url: Optional[str] = None  # Feature 7
+    created_at:        datetime = Field(default_factory=datetime.utcnow)

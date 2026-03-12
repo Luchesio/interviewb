@@ -1,5 +1,6 @@
 """
 Interview service — async session CRUD with timer support.
+Updated: language field propagated through create_session.
 """
 
 import uuid
@@ -15,13 +16,14 @@ log = logging.getLogger(__name__)
 
 
 async def create_session(
-    job_title:        str   = "",
-    job_description:  str   = "",
-    resume_text:      str   = "",
-    candidate_name:   str   = "Candidate",
-    intro_text:       str   = "",
-    first_question:   str   = "",
-    duration_minutes: int   = 30,
+    job_title:        str = "",
+    job_description:  str = "",
+    resume_text:      str = "",
+    candidate_name:   str = "Candidate",
+    intro_text:       str = "",
+    first_question:   str = "",
+    duration_minutes: int = 30,
+    language:         str = "en",
 ) -> InterviewSession:
     session = InterviewSession(
         session_id       = str(uuid.uuid4()),
@@ -32,7 +34,8 @@ async def create_session(
         introText        = intro_text,
         questions        = [first_question] if first_question else [],
         duration_minutes = duration_minutes,
-        expires_at       = 0.0,   # set when the WS connection opens
+        expires_at       = 0.0,
+        language         = language,
     )
     await store_session(session)
     return session
@@ -43,7 +46,6 @@ async def get_session(session_id: str) -> Optional[InterviewSession]:
 
 
 async def start_timer(session: InterviewSession) -> None:
-    """Call this once when the WebSocket connection is accepted (interview begins)."""
     if session.expires_at == 0:
         session.expires_at = time.time() + session.duration_minutes * 60
         await store_session(session)

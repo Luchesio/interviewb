@@ -10,14 +10,14 @@ class InteriewStatusEnum(str, Enum):
 
 
 class Answer(BaseModel):
-    question:               str
-    answer:                 Optional[str] = None
-    skip:                   bool          = False
-    filler_word_count:      int           = 0
-    filler_words_found:     list[str]     = Field(default_factory=list)
-    sentiment:              str           = "neutral"
-    sentiment_score:        float         = 0.0
-    confidence_level:       str           = "medium"
+    question:                str
+    answer:                  Optional[str] = None
+    skip:                    bool          = False
+    filler_word_count:       int           = 0
+    filler_words_found:      list[str]     = Field(default_factory=list)
+    sentiment:               str           = "neutral"
+    sentiment_score:         float         = 0.0
+    confidence_level:        str           = "medium"
     answer_duration_seconds: Optional[float] = None
 
 
@@ -28,18 +28,17 @@ class InterviewSession(BaseModel):
     resume_text:      str = ""
     candidate_name:   str = "Candidate"
     introText:        str = ""
+    language:         str = "en"           # Feature 6: interview language
 
-    # Timer fields — duration_minutes set at creation, expires_at = Unix timestamp
     duration_minutes: int   = 30
-    expires_at:       float = 0.0   # 0 means not yet started (set when WS opens)
+    expires_at:       float = 0.0
 
-    questions: list[str]  = Field(default_factory=list)
-    answers:   list[Answer] = Field(default_factory=list)
-    current_index: int    = 0
+    questions:     list[str]    = Field(default_factory=list)
+    answers:       list[Answer] = Field(default_factory=list)
+    current_index: int          = 0
 
     status: InteriewStatusEnum = InteriewStatusEnum.IN_PROGRESS
 
-    # Convenience helpers (not stored — computed on the fly)
     def seconds_remaining(self) -> float:
         if self.expires_at == 0:
             return self.duration_minutes * 60
