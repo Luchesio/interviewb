@@ -7,15 +7,25 @@ ENV vars:
   EMAIL_FROM       – sender address (default: noreply@yourdomain.com)
   APP_BASE_URL     – public URL of the frontend (default: http://localhost:4200)
 
+Delay strategy:
+  When RESEND_API_KEY is set the 10-minute candidate email delay is handled
+  entirely by Resend's scheduledAt field — no asyncio.sleep, no background
+  task, no in-process timer. This is safe on serverless platforms (Vercel,
+  Railway, etc.) where the process exits as soon as the HTTP response is sent.
+
+  When falling back to SendGrid the email is sent immediately (SendGrid's
+  free tier has no scheduled-send API). The delay is simply dropped — the
+  candidate receives the email right away instead of after 10 minutes.
+
 Gmail desktop clips emails over ~102 KB. Each builder uses only the CSS it
 actually needs (no shared mega-block) and all style strings are minified to
 keep every email well under that threshold.
 """
 
-import asyncio
 import os
 import logging
 import httpx
+from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger(__name__)
 
@@ -204,17 +214,22 @@ def _build_fit_html(candidate_name: str, job_title: str,
 
 
 async def send_candidate_fit_email(
-    to_email:       str,
-    candidate_name: str,
-    job_title:      str,
-    is_fit:         bool,
-    token:          str | None = None,
+    to_email:        str,
+    candidate_name:  str,
+    job_title:       str,
+    is_fit:          bool,
+    token:           str | None = None,
+    delay_minutes:   int = 0,
 ) -> bool:
     """
     Send a fit/no-fit email to the candidate.
 
     - is_fit=True  → professional shortlist email with the interview link.
     - is_fit=False → warm, professional rejection email.
+
+    delay_minutes: when > 0 and Resend is the active provider, the email is
+    scheduled via Resend's scheduledAt field so the delay is handled entirely
+    server-side. No asyncio.sleep or background task is needed in the caller.
 
     Reads as if written by a human recruiter. No AI analysis, screening scores,
     match percentages, gap analysis, or mention of automated screening appears
@@ -224,10 +239,17 @@ async def send_candidate_fit_email(
                   if (is_fit and token) else None)
     subject = (f"You Have Been Shortlisted — {job_title}"
                if is_fit else f"Your Application for {job_title}")
+
+    # Compute the scheduled delivery time if a delay is requested
+    scheduled_at: datetime | None = None
+    if delay_minutes > 0:
+        scheduled_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+
     return await _dispatch(
         to_email, subject,
         _build_fit_html(candidate_name, job_title, is_fit, verify_url),
         dev_label=f"fit_email(is_fit={is_fit}) → {to_email}",
+        scheduled_at=scheduled_at,
     )
 
 
@@ -331,15 +353,17 @@ async def send_report_to_recruiter(
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
 # Exponential backoff: attempt 1 → wait 30s, attempt 2 → wait 60s, attempt 3 → wait 120s
-_RETRY_DELAYS = [30, 60, 120]   # seconds between attempts (3 retries = 4 total attempts)
+# NOTE: retries only apply to immediate sends. Scheduled Resend emails do not
+# need retries — if the API call succeeds (201) Resend owns the delivery.
+_RETRY_DELAYS = [30, 60, 120]
 
 
 async def _with_retry(fn, label: str) -> bool:
     """
     Call an async send function up to 4 times (1 initial + 3 retries) with
     exponential backoff. Returns True as soon as one attempt succeeds.
-    A transient ConnectError (e.g. momentary network drop) will not lose the email.
     """
+    import asyncio
     for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
         if delay:
             log.warning("[EMAIL] attempt %d for %s — retrying in %ds", attempt, label, delay)
@@ -359,31 +383,68 @@ async def _with_retry(fn, label: str) -> bool:
 
 # ── Internal send dispatcher ──────────────────────────────────────────────────
 
-async def _dispatch(to: str, subject: str, html: str, dev_label: str = "") -> bool:
+async def _dispatch(
+    to:           str,
+    subject:      str,
+    html:         str,
+    dev_label:    str = "",
+    scheduled_at: "datetime | None" = None,
+) -> bool:
     if RESEND_API_KEY:
-        return await _with_retry(lambda: _send_via_resend(to, subject, html),
-                                 label=f"resend→{to}")
+        # Scheduled sends go directly — no retry loop needed because if the
+        # API call itself succeeds, Resend owns the delivery from that point.
+        if scheduled_at:
+            return await _send_via_resend(to, subject, html, scheduled_at=scheduled_at)
+        return await _with_retry(
+            lambda: _send_via_resend(to, subject, html),
+            label=f"resend→{to}",
+        )
     if SENDGRID_API_KEY:
-        return await _with_retry(lambda: _send_via_sendgrid(to, subject, html),
-                                 label=f"sendgrid→{to}")
+        # SendGrid free tier has no scheduled-send API — send immediately.
+        if scheduled_at:
+            log.info("[EMAIL] SendGrid fallback: scheduled_at ignored, sending immediately to %s", to)
+        return await _with_retry(
+            lambda: _send_via_sendgrid(to, subject, html),
+            label=f"sendgrid→{to}",
+        )
     log.warning("[EMAIL DEV] %s | Subject: %s", dev_label, subject)
     return True
 
 
-async def _send_via_resend(to: str, subject: str, html: str) -> bool:
-    payload = {"from": EMAIL_FROM, "to": [to], "subject": subject, "html": html}
+async def _send_via_resend(
+    to:           str,
+    subject:      str,
+    html:         str,
+    scheduled_at: "datetime | None" = None,
+) -> bool:
+    payload: dict = {
+        "from":    EMAIL_FROM,
+        "to":      [to],
+        "subject": subject,
+        "html":    html,
+    }
+    if scheduled_at:
+        # Resend expects ISO-8601 UTC, e.g. "2024-09-05T11:52:01.858Z"
+        payload["scheduledAt"] = scheduled_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        log.info("Resend: scheduling email to %s at %s", to, payload["scheduledAt"])
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
-                     "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type":  "application/json",
+            },
             json=payload,
             timeout=15,
         )
     if resp.status_code in (200, 201):
-        log.info("Resend: sent to %s", to)
+        if scheduled_at:
+            log.info("Resend: scheduled delivery accepted for %s", to)
+        else:
+            log.info("Resend: sent to %s", to)
         return True
-    # 429 = rate limited, 5xx = server error — both worth retrying
+    # 429 = rate limited, 5xx = server error — both worth retrying on immediate sends
     log.error("Resend HTTP %s for %s: %s", resp.status_code, to, resp.text[:200])
     return False
 
@@ -398,8 +459,10 @@ async def _send_via_sendgrid(to: str, subject: str, html: str) -> bool:
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.sendgrid.com/v3/mail/send",
-            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
-                     "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type":  "application/json",
+            },
             json=payload,
             timeout=15,
         )

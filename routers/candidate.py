@@ -12,9 +12,12 @@ Changes (new features):
     and the endpoint returns early (no interview session / token created).
     If the candidate IS a fit, they receive a shortlist email that also
     contains the interview link (the old plain-invite email is replaced).
+
+  • The 10-minute email delay is now handled entirely by Resend's scheduledAt
+    field — no asyncio.sleep, no background task, no in-process timer.
+    This makes the endpoint fully serverless-safe (Vercel, Railway, etc.).
 """
 
-import asyncio
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -35,7 +38,7 @@ router = APIRouter(tags=["Candidate"])
 
 TOKEN_TTL_HOURS   = 72
 MAX_MEDIA_BYTES   = 500 * 1024 * 1024   # 500 MB
-FIT_EMAIL_DELAY_S = 10 * 60             # 10 minutes — delay before sending fit/no-fit email
+FIT_EMAIL_DELAY_M = 10                  # minutes — passed to Resend scheduledAt
 
 
 # ── 1. Candidate applies ──────────────────────────────────────────────────────
@@ -57,13 +60,13 @@ async def apply(
       2. Extract resume text.
       3. Screen resume against the job via AI.
       4a. NOT FIT  → persist application as REJECTED, schedule rejection email
-                     after 10 minutes, return immediately.
+                     via Resend (10-minute delay), return immediately.
       4b. FIT      → generate interview session + token, schedule shortlist email
-                     (with interview link) after 10 minutes, return immediately.
+                     (with interview link) via Resend (10-minute delay), return.
 
-    The 10-minute delay on both email paths is intentional — it prevents the
-    result from appearing instantaneous (which feels like it wasn't reviewed)
-    and keeps the system decoupled from the HTTP response cycle.
+    The 10-minute delay is handled by Resend's scheduledAt field — the API
+    call returns instantly and Resend delivers at the right time. No background
+    tasks or asyncio.sleep are needed, making this fully serverless-safe.
     """
     # ── Step 1: validate job ──────────────────────────────────────────────────
     job = await jobs_col().find_one({"job_id": job_id, "is_active": True})
@@ -102,27 +105,19 @@ async def apply(
         )
         await applications_col().insert_one(application.model_dump())
 
-        # Capture loop-local copies for the closure
-        _app_id     = application.application_id
-        _email      = candidate_email
-        _name       = candidate_name
-        _job_title  = job["job_title"]
-
-        async def _send_rejection_after_delay() -> None:
-            await asyncio.sleep(FIT_EMAIL_DELAY_S)
-            log.info("Sending rejection email for application %s (after %ds)", _app_id, FIT_EMAIL_DELAY_S)
-            ok = await send_candidate_fit_email(
-                to_email       = _email,
-                candidate_name = _name,
-                job_title      = _job_title,
-                is_fit         = False,
-                token          = None,
-            )
-            if not ok:
-                log.warning("Rejection email delivery failed for application %s", _app_id)
-
-        asyncio.create_task(_send_rejection_after_delay())
-        log.info("Rejection email scheduled in %ds for application %s", FIT_EMAIL_DELAY_S, _app_id)
+        # Schedule rejection email via Resend's scheduledAt — no sleep, no background task.
+        ok = await send_candidate_fit_email(
+            to_email       = candidate_email,
+            candidate_name = candidate_name,
+            job_title      = job["job_title"],
+            is_fit         = False,
+            token          = None,
+            delay_minutes  = FIT_EMAIL_DELAY_M,
+        )
+        if not ok:
+            log.warning("Rejection email scheduling failed for application %s", application.application_id)
+        else:
+            log.info("Rejection email scheduled (%dm delay) for application %s", FIT_EMAIL_DELAY_M, application.application_id)
 
         return {
             "message":        "Thank you for applying! We are reviewing your application and will be in touch within the next few minutes.",
@@ -175,29 +170,19 @@ async def apply(
     )
     await tokens_col().insert_one(interview_token.model_dump())
 
-    # Schedule shortlist email (with interview link) after a 10-minute delay.
-    # Capture all values in loop-local variables so the closure is safe.
-    _app_id2    = application.application_id
-    _email2     = candidate_email
-    _name2      = candidate_name
-    _job_title2 = job["job_title"]
-    _token2     = raw_token
-
-    async def _send_shortlist_after_delay() -> None:
-        await asyncio.sleep(FIT_EMAIL_DELAY_S)
-        log.info("Sending shortlist email for application %s (after %ds)", _app_id2, FIT_EMAIL_DELAY_S)
-        ok = await send_candidate_fit_email(
-            to_email       = _email2,
-            candidate_name = _name2,
-            job_title      = _job_title2,
-            is_fit         = True,
-            token          = _token2,
-        )
-        if not ok:
-            log.warning("Shortlist email delivery failed for application %s", _app_id2)
-
-    asyncio.create_task(_send_shortlist_after_delay())
-    log.info("Shortlist email scheduled in %ds for application %s", FIT_EMAIL_DELAY_S, _app_id2)
+    # Schedule shortlist email via Resend's scheduledAt — no sleep, no background task.
+    ok = await send_candidate_fit_email(
+        to_email       = candidate_email,
+        candidate_name = candidate_name,
+        job_title      = job["job_title"],
+        is_fit         = True,
+        token          = raw_token,
+        delay_minutes  = FIT_EMAIL_DELAY_M,
+    )
+    if not ok:
+        log.warning("Shortlist email scheduling failed for application %s", application.application_id)
+    else:
+        log.info("Shortlist email scheduled (%dm delay) for application %s", FIT_EMAIL_DELAY_M, application.application_id)
 
     return {
         "message":        "Thank you for applying! We are reviewing your application and will be in touch within the next few minutes.",
@@ -314,61 +299,3 @@ async def upload_media(
     allowed_types = {"video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/wav"}
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=415, detail=f"Unsupported media type: {file.content_type}")
-
-    from db.mongo import get_gridfs
-    fs      = await get_gridfs()
-    file_id = await fs.upload_from_stream(
-        filename = file.filename or f"{session_id}.webm",
-        source   = content,
-        metadata = {
-            "session_id":   session_id,
-            "media_type":   media_type,
-            "content_type": file.content_type,
-        },
-    )
-
-    media_id = str(uuid.uuid4())
-    media_doc = {
-        "media_id":    media_id,
-        "session_id":  session_id,
-        "gridfs_id":   str(file_id),
-        "media_type":  media_type,
-        "filename":    file.filename,
-        "size_bytes":  len(content),
-        "content_type": file.content_type,
-        "uploaded_at": datetime.now(timezone.utc),
-    }
-    await media_col().insert_one(media_doc)
-
-    from db.mongo import reports_col
-    await reports_col().update_one(
-        {"session_id": session_id},
-        {"$set": {"media_id": media_id, "media_type": media_type}},
-    )
-
-    log.info("Media uploaded: %s session=%s size=%.1fMB", media_id, session_id, size_mb)
-    return {"media_id": media_id, "size_mb": round(size_mb, 2)}
-
-
-# ── 5. Stream media recording (for recruiter review) ─────────────────────────
-
-@router.get("/interview/media/{media_id}")
-async def stream_media(media_id: str):
-    """Return the binary media file for a recording."""
-    from db.mongo import get_gridfs
-    from fastapi.responses import StreamingResponse
-
-    media_doc = await media_col().find_one({"media_id": media_id})
-    if not media_doc:
-        raise HTTPException(status_code=404, detail="Media not found")
-
-    fs = await get_gridfs()
-    from bson import ObjectId
-    grid_out = await fs.open_download_stream(ObjectId(media_doc["gridfs_id"]))
-    content  = await grid_out.read()
-
-    return StreamingResponse(
-        iter([content]),
-        media_type=media_doc.get("content_type", "video/webm"),
-        headers={"Content-Disposition": f'inline; filename="{media_doc["filename"]}"'},
-    )
