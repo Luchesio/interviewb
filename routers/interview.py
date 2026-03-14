@@ -6,6 +6,8 @@ Changes (new features):
     instead of returning it to the candidate frontend.
   - The endpoint still returns { report_id } so the Angular component can show
     a "report sent" confirmation screen rather than rendering the report itself.
+  - Fixed: asyncio.create_task() replaced with await for the report email and
+    Slack notification so they complete before the serverless function exits.
 """
 
 import asyncio
@@ -104,7 +106,7 @@ async def start_interview(session_id: str):
     }
 
 
-# ── 3. WebSocket — main conversation channel ───────────────────────────────────
+# ── 3. WebSocket — main conversation channel ──────────────────────────────────
 
 @router.websocket("/ws/{session_id}")
 async def interview_websocket(websocket: WebSocket, session_id: str):
@@ -307,6 +309,8 @@ async def report(session_id: str):
         )
 
     # ── Email report to recruiter ─────────────────────────────────────────────
+    # Using await directly (not asyncio.create_task) so the email is fully
+    # handed off to Resend before the serverless function exits on Vercel.
     if app_doc:
         job_doc = await jobs_col().find_one({"job_id": app_doc["job_id"]})
         if job_doc:
@@ -315,7 +319,7 @@ async def report(session_id: str):
 
             if recruiter and recruiter.get("email"):
                 from services.email_service import send_report_to_recruiter
-                asyncio.create_task(send_report_to_recruiter(
+                ok = await send_report_to_recruiter(
                     to_email       = recruiter["email"],
                     recruiter_name = recruiter.get("name") or recruiter.get("email", "Recruiter"),
                     candidate_name = app_doc["candidate_name"],
@@ -323,25 +327,33 @@ async def report(session_id: str):
                     report         = result,
                     report_id      = report_id,
                     job_id         = app_doc["job_id"],
-                ))
-                log.info(
-                    "Report email queued → recruiter %s | report_id=%s",
-                    recruiter["email"], report_id,
                 )
+                if ok:
+                    log.info(
+                        "Report email sent → recruiter %s | report_id=%s",
+                        recruiter["email"], report_id,
+                    )
+                else:
+                    log.warning(
+                        "Report email failed → recruiter %s | report_id=%s",
+                        recruiter["email"], report_id,
+                    )
             else:
                 log.warning(
                     "Recruiter %s has no email address on record — report not emailed.",
                     recruiter_id,
                 )
 
-            # Slack notification (existing Feature 7)
+            # ── Slack notification ────────────────────────────────────────────
+            # Also awaited directly for the same reason — fire-and-forget tasks
+            # are silently killed on Vercel before they complete.
             from routers.recruiter import notify_new_report
-            asyncio.create_task(notify_new_report(
+            await notify_new_report(
                 job_id         = app_doc["job_id"],
                 candidate_name = app_doc["candidate_name"],
                 job_title      = session.job_title,
                 recruiter_id   = recruiter_id,
-            ))
+            )
 
     log.info("Report saved: report_id=%s session=%s", report_id, session_id)
 
