@@ -3,19 +3,14 @@ Candidate router — public endpoints.
 
 POST /apply                              – submit application
 GET  /interview/verify?token=xxx         – validate token → load session
-GET  /candidate/applications?email=x     – candidate dashboard (Feature 2)
-POST /interview/upload-media             – upload WebRTC recording (Feature 3)
+GET  /candidate/applications?email=x     – candidate dashboard
+POST /interview/upload-media             – upload recording to Cloudinary
+GET  /interview/media/{media_id}         – redirect to Cloudinary URL
 
-Changes (new features):
-  • /apply now screens the resume against the job BEFORE generating interview
-    questions. If the candidate is NOT a fit, they receive a rejection email
-    and the endpoint returns early (no interview session / token created).
-    If the candidate IS a fit, they receive a shortlist email that also
-    contains the interview link (the old plain-invite email is replaced).
-
-  • The 10-minute email delay is now handled entirely by Resend's scheduledAt
-    field — no asyncio.sleep, no background task, no in-process timer.
-    This makes the endpoint fully serverless-safe (Vercel, Railway, etc.).
+Recording storage:
+  Videos (webcam + screen share) are uploaded directly to Cloudinary.
+  Only the Cloudinary secure_url is stored in MongoDB — no binary data
+  ever touches the database, keeping MongoDB usage minimal.
 """
 
 import uuid
@@ -24,21 +19,22 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import RedirectResponse
 
 from db.mongo import applications_col, tokens_col, jobs_col, reports_col, media_col
 from models.job import Application, ApplicationStatus, InterviewToken
 from services.ai_service import generate_questions_intro, screen_resume
 from services.interview_service import create_session
 from services.email_service import send_candidate_fit_email
+from services.cloudinary_service import upload_recording
 from util.file_util import extract_text, validate_file
 
 log    = logging.getLogger(__name__)
 router = APIRouter(tags=["Candidate"])
 
 TOKEN_TTL_HOURS   = 72
-MAX_MEDIA_BYTES   = 500 * 1024 * 1024   # 500 MB
-FIT_EMAIL_DELAY_M = 10                  # minutes — passed to Resend scheduledAt
+MAX_MEDIA_BYTES   = 500 * 1024 * 1024
+FIT_EMAIL_DELAY_M = 10
 
 
 # ── 1. Candidate applies ──────────────────────────────────────────────────────
@@ -52,32 +48,13 @@ async def apply(
     duration_minutes: int        = Form(15),
     language:         str        = Form("en"),
 ):
-    """
-    Public apply endpoint.
-
-    Flow:
-      1. Validate the job exists and is active.
-      2. Extract resume text.
-      3. Screen resume against the job via AI.
-      4a. NOT FIT  → persist application as REJECTED, schedule rejection email
-                     via Resend (10-minute delay), return immediately.
-      4b. FIT      → generate interview session + token, schedule shortlist email
-                     (with interview link) via Resend (10-minute delay), return.
-
-    The 10-minute delay is handled by Resend's scheduledAt field — the API
-    call returns instantly and Resend delivers at the right time. No background
-    tasks or asyncio.sleep are needed, making this fully serverless-safe.
-    """
-    # ── Step 1: validate job ──────────────────────────────────────────────────
     job = await jobs_col().find_one({"job_id": job_id, "is_active": True})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or no longer active")
 
-    # ── Step 2: extract resume text ───────────────────────────────────────────
     await validate_file(resume)
     resume_text = await extract_text(resume)
 
-    # ── Step 3: AI resume screening ───────────────────────────────────────────
     screening = await screen_resume(
         job_title       = job["job_title"],
         job_description = job["job_description"],
@@ -91,7 +68,6 @@ async def apply(
         candidate_email, job_id, is_fit, score,
     )
 
-    # ── Step 4a: NOT a fit ────────────────────────────────────────────────────
     if not is_fit:
         application = Application(
             application_id  = str(uuid.uuid4()),
@@ -105,7 +81,6 @@ async def apply(
         )
         await applications_col().insert_one(application.model_dump())
 
-        # Schedule rejection email via Resend's scheduledAt — no sleep, no background task.
         ok = await send_candidate_fit_email(
             to_email       = candidate_email,
             candidate_name = candidate_name,
@@ -125,7 +100,6 @@ async def apply(
             "screening":      {"is_fit": False, "score": score},
         }
 
-    # ── Step 4b: IS a fit — generate interview session ────────────────────────
     ai_resp = await generate_questions_intro(
         job_title        = job["job_title"],
         job_description  = job["job_description"],
@@ -170,7 +144,6 @@ async def apply(
     )
     await tokens_col().insert_one(interview_token.model_dump())
 
-    # Schedule shortlist email via Resend's scheduledAt — no sleep, no background task.
     ok = await send_candidate_fit_email(
         to_email       = candidate_email,
         candidate_name = candidate_name,
@@ -195,7 +168,6 @@ async def apply(
 
 @router.get("/interview/verify")
 async def verify_token(token: str):
-    """Validates the interview token and returns session bootstrap data."""
     now = datetime.now(timezone.utc)
 
     token_doc = await tokens_col().find_one({"token": token})
@@ -242,10 +214,6 @@ async def verify_token(token: str):
 
 @router.get("/candidate/applications")
 async def get_candidate_applications(email: str):
-    """
-    Return all applications and their statuses for a candidate email.
-    No auth required — candidates use their email address to look up status.
-    """
     cursor = applications_col().find(
         {"candidate_email": email},
         {"_id": 0, "resume_text": 0},
@@ -256,7 +224,6 @@ async def get_candidate_applications(email: str):
     enriched = []
     for app in applications:
         entry = dict(app)
-
         job = await jobs_col().find_one({"job_id": app["job_id"]}, {"job_title": 1, "_id": 0})
         entry["job_title"] = job.get("job_title", "Unknown Role") if job else "Unknown Role"
 
@@ -282,14 +249,18 @@ async def get_candidate_applications(email: str):
     return {"email": email, "applications": enriched, "total": len(enriched)}
 
 
-# ── 4. Upload media recording ─────────────────────────────────────────────────
+# ── 4. Upload media recording — stored on Cloudinary ─────────────────────────
 
 @router.post("/interview/upload-media", status_code=201)
 async def upload_media(
     session_id: str        = Form(...),
-    media_type: str        = Form("video"),
+    media_type: str        = Form("webcam"),   # "webcam" | "screen"
     file:       UploadFile = File(...),
 ):
+    """
+    Receive a MediaRecorder blob and upload it to Cloudinary.
+    Only the resulting URL is stored in MongoDB — no binary data in the DB.
+    """
     content = await file.read()
     size_mb  = len(content) / (1024 * 1024)
 
@@ -299,3 +270,59 @@ async def upload_media(
     allowed_types = {"video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/wav"}
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=415, detail=f"Unsupported media type: {file.content_type}")
+
+    cloudinary_url = await upload_recording(
+        file_bytes = content,
+        filename   = file.filename or f"{session_id}_{media_type}.webm",
+        session_id = session_id,
+        media_type = media_type,
+    )
+
+    if not cloudinary_url:
+        raise HTTPException(status_code=502, detail="Failed to upload recording to Cloudinary.")
+
+    media_id  = str(uuid.uuid4())
+    media_doc = {
+        "media_id":       media_id,
+        "session_id":     session_id,
+        "media_type":     media_type,
+        "filename":       file.filename,
+        "size_bytes":     len(content),
+        "content_type":   file.content_type,
+        "cloudinary_url": cloudinary_url,
+        "uploaded_at":    datetime.now(timezone.utc),
+    }
+    await media_col().insert_one(media_doc)
+
+    # Store separate URL fields on the report so recruiters can access both streams
+    url_field = "webcam_url" if media_type == "webcam" else "screen_url"
+    await reports_col().update_one(
+        {"session_id": session_id},
+        {"$set": {url_field: cloudinary_url}},
+    )
+
+    log.info(
+        "Cloudinary upload OK: %s session=%s type=%s size=%.1fMB",
+        media_id, session_id, media_type, size_mb,
+    )
+    return {
+        "media_id":       media_id,
+        "cloudinary_url": cloudinary_url,
+        "size_mb":        round(size_mb, 2),
+    }
+
+
+# ── 5. Get media — redirect to Cloudinary URL ────────────────────────────────
+
+@router.get("/interview/media/{media_id}")
+async def get_media_url(media_id: str):
+    """Redirect to the Cloudinary URL — video streams directly from Cloudinary."""
+    media_doc = await media_col().find_one({"media_id": media_id})
+    if not media_doc:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    cloudinary_url = media_doc.get("cloudinary_url")
+    if not cloudinary_url:
+        raise HTTPException(status_code=404, detail="Recording URL not available")
+
+    return RedirectResponse(url=cloudinary_url, status_code=302)

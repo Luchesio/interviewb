@@ -4,7 +4,7 @@ uvicorn[standard]
 motor               # async MongoDB driver
 pymongo
 
-# Auth (Feature 1)
+# Auth
 python-jose[cryptography]  # JWT encode/decode
 passlib[bcrypt]             # password hashing
 
@@ -12,18 +12,18 @@ passlib[bcrypt]             # password hashing
 openai
 python-dotenv
 
-# Soft skill analysis (Feature 8)
+# Soft skill analysis
 textblob
-# Optional HuggingFace NLP (comment out if not needed):
-# transformers>=4.40.0
-# torch>=2.2.0
 
-# Media / File handling (Feature 3)
+# Media / File handling
 python-multipart
 PyPDF2
 
-# HTTP client (for Slack webhooks - Feature 7, and email)
+# HTTP client (email + Cloudinary uploads)
 httpx
+
+# Cloudinary — video recording storage
+cloudinary
 
 # Validation
 pydantic[email]
