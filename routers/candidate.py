@@ -20,20 +20,19 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from db.mongo import applications_col, tokens_col, jobs_col, reports_col, media_col
 from models.job import Application, ApplicationStatus, InterviewToken
 from services.ai_service import generate_questions_intro, screen_resume
 from services.interview_service import create_session
 from services.email_service import send_candidate_fit_email
-from services.cloudinary_service import upload_recording
 from util.file_util import extract_text, validate_file
 
 log    = logging.getLogger(__name__)
 router = APIRouter(tags=["Candidate"])
 
 TOKEN_TTL_HOURS   = 72
-MAX_MEDIA_BYTES   = 500 * 1024 * 1024
 FIT_EMAIL_DELAY_M = 10
 
 
@@ -249,67 +248,52 @@ async def get_candidate_applications(email: str):
     return {"email": email, "applications": enriched, "total": len(enriched)}
 
 
-# ── 4. Upload media recording — stored on Cloudinary ─────────────────────────
+# ── 4. Save media URL — frontend uploads directly to Cloudinary ──────────────
+#
+# Video blobs exceed Vercel's 4.5 MB serverless function limit so they must
+# never pass through this server.  The Angular frontend uploads the blob
+# straight to Cloudinary (unsigned preset) and then sends only the resulting
+# URL here.  This endpoint stores that URL in MongoDB — a tiny JSON payload
+# that is well within all platform limits.
 
-@router.post("/interview/upload-media", status_code=201)
-async def upload_media(
-    session_id: str        = Form(...),
-    media_type: str        = Form("webcam"),   # "webcam" | "screen"
-    file:       UploadFile = File(...),
-):
+class SaveMediaUrlRequest(BaseModel):
+    session_id:     str
+    media_type:     str           # "webcam" | "screen"
+    cloudinary_url: str
+    size_bytes:     int = 0
+
+
+@router.post("/interview/save-media-url", status_code=201)
+async def save_media_url(body: SaveMediaUrlRequest):
     """
-    Receive a MediaRecorder blob and upload it to Cloudinary.
-    Only the resulting URL is stored in MongoDB — no binary data in the DB.
+    Persist the Cloudinary URL returned by a direct browser → Cloudinary upload.
+    No file data passes through this endpoint — only a short URL string.
     """
-    content = await file.read()
-    size_mb  = len(content) / (1024 * 1024)
-
-    if len(content) > MAX_MEDIA_BYTES:
-        raise HTTPException(status_code=413, detail=f"File too large (max 500 MB, got {size_mb:.1f} MB)")
-
-    allowed_types = {"video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/wav"}
-    if file.content_type not in allowed_types:
-        raise HTTPException(status_code=415, detail=f"Unsupported media type: {file.content_type}")
-
-    cloudinary_url = await upload_recording(
-        file_bytes = content,
-        filename   = file.filename or f"{session_id}_{media_type}.webm",
-        session_id = session_id,
-        media_type = media_type,
-    )
-
-    if not cloudinary_url:
-        raise HTTPException(status_code=502, detail="Failed to upload recording to Cloudinary.")
+    if not body.cloudinary_url.startswith("https://res.cloudinary.com/"):
+        raise HTTPException(status_code=400, detail="Invalid Cloudinary URL.")
 
     media_id  = str(uuid.uuid4())
     media_doc = {
         "media_id":       media_id,
-        "session_id":     session_id,
-        "media_type":     media_type,
-        "filename":       file.filename,
-        "size_bytes":     len(content),
-        "content_type":   file.content_type,
-        "cloudinary_url": cloudinary_url,
+        "session_id":     body.session_id,
+        "media_type":     body.media_type,
+        "cloudinary_url": body.cloudinary_url,
+        "size_bytes":     body.size_bytes,
         "uploaded_at":    datetime.now(timezone.utc),
     }
     await media_col().insert_one(media_doc)
 
-    # Store separate URL fields on the report so recruiters can access both streams
-    url_field = "webcam_url" if media_type == "webcam" else "screen_url"
+    url_field = "webcam_url" if body.media_type == "webcam" else "screen_url"
     await reports_col().update_one(
-        {"session_id": session_id},
-        {"$set": {url_field: cloudinary_url}},
+        {"session_id": body.session_id},
+        {"$set": {url_field: body.cloudinary_url}},
     )
 
     log.info(
-        "Cloudinary upload OK: %s session=%s type=%s size=%.1fMB",
-        media_id, session_id, media_type, size_mb,
+        "Media URL saved: %s session=%s type=%s",
+        media_id, body.session_id, body.media_type,
     )
-    return {
-        "media_id":       media_id,
-        "cloudinary_url": cloudinary_url,
-        "size_mb":        round(size_mb, 2),
-    }
+    return {"media_id": media_id, "cloudinary_url": body.cloudinary_url}
 
 
 # ── 5. Get media — redirect to Cloudinary URL ────────────────────────────────
