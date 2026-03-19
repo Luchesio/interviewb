@@ -162,8 +162,15 @@ async def submit_answer(body: AnswerRequest):
     if session.status == InteriewStatusEnum.COMPLETED:
         return AnswerResponse(interview_ended=True, reason="completed")
 
-    # Server-side time guard — frontend timer is the primary UX but we
-    # enforce the limit here too so candidates can't POST answers after expiry
+    # Start the server-side timer on the first answer if not already started.
+    # The frontend never calls GET /start — it uses the session snapshot directly.
+    # Without this, expires_at stays 0 and seconds_remaining() returns the full
+    # duration on every answer, which causes the timer to appear to reset.
+    if session.expires_at == 0:
+        await start_timer(session)
+        session = await get_session(body.session_id)
+
+    # Server-side time guard
     if session.is_time_up():
         await mark_completed(session)
         return AnswerResponse(interview_ended=True, reason="time_up")
