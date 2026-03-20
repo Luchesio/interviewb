@@ -1,34 +1,27 @@
 """
-Interview router — timer-driven WebSocket interview engine.
+Interview router — HTTP-based interview engine (Vercel-compatible).
 
-Performance optimisations (v2):
-  1. app_doc, job_doc, custom_questions, and language are loaded ONCE at
-     WebSocket open and reused on every turn — eliminates 2 MongoDB round-trips
-     per answer (~300–500 ms saved each turn).
-  2. save_answer is awaited first, then get_session — ensures the AI always
-     receives the full, up-to-date conversation history including the latest answer.
-  3. A single get_session is used at the top of the answer loop (was two).
-  4. Vercel keep-warm: the WebSocket tick loop now also pings every 25 s so
-     the function stays hot throughout the interview.
+Architecture change (v4 — Vercel fix):
+  WebSockets are NOT supported by Vercel serverless functions for Python/FastAPI.
+  The previous WS-based flow was killed by Vercel's function execution timeout
+  mid-interview, leaving the frontend permanently stuck on "Processing your answer".
 
-Bug fixes (v3):
-  - FIX 1: ping (and any unknown) messages from the frontend are now ignored
-    with `continue` instead of silently falling through and consuming the next
-    receive_json() call — which was swallowing the real "answer" message and
-    leaving the candidate stuck on "Processing…" forever.
-  - FIX 2: save_answer is now awaited BEFORE get_session (was parallel via
-    asyncio.gather), so the session fetched for build_conversation_history
-    always contains the answer that was just saved.
+  The Q&A loop is now driven by a simple REST endpoint:
+    POST /interview/answer/{session_id}
+  The frontend POSTs the transcript → the backend saves it, generates the next
+  question via GPT, and returns it in the same HTTP response. No persistent
+  connection required; every call is a normal short-lived serverless invocation.
 
-Other changes:
-  - Report endpoint still emails the full report to the recruiter who owns the job.
-  - Slack notification awaited directly (not create_task) so it completes before
-    the serverless function exits on Vercel.
+  The WebSocket endpoint is kept below but is no longer used by the frontend.
+
+Other notes:
+  - Timer is maintained client-side; seconds_remaining is returned as a
+    server-side sanity-check value only.
+  - Report endpoint emails the full report to the recruiter who owns the job.
 """
 
 import asyncio
 import logging
-import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -37,6 +30,7 @@ from fastapi import (
     APIRouter, File, Form, HTTPException, UploadFile,
     WebSocket, WebSocketDisconnect,
 )
+from pydantic import BaseModel
 
 from models.interview import InteriewStatusEnum
 from services.ai_service import (
@@ -113,6 +107,9 @@ async def start_interview(session_id: str):
     if not session or session.status == InteriewStatusEnum.COMPLETED:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # Start the server-side timer on first load
+    await start_timer(session)
+
     return {
         "introText":       session.introText,
         "firstQuestion":   session.questions[0] if session.questions else "",
@@ -122,7 +119,87 @@ async def start_interview(session_id: str):
     }
 
 
-# ── 3. WebSocket — main conversation channel ──────────────────────────────────
+# ── 3. HTTP answer submission — main Q&A endpoint (replaces WebSocket) ────────
+
+class AnswerRequest(BaseModel):
+    text:     Optional[str]   = None   # None when skip=True
+    duration: Optional[float] = None   # seconds the candidate spoke
+    skip:     bool            = False
+
+
+@router.post("/answer/{session_id}")
+async def submit_answer(session_id: str, body: AnswerRequest):
+    """
+    Receive one candidate answer → save it → generate & return the next question.
+
+    Returns one of:
+      { "type": "question",   "text": "...", "index": N, "seconds_remaining": N }
+      { "type": "time_up" }
+      { "type": "completed" }
+    """
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if session.status == InteriewStatusEnum.COMPLETED:
+        return {"type": "completed"}
+
+    if session.is_time_up():
+        await mark_completed(session)
+        return {"type": "time_up"}
+
+    # Save answer FIRST, then fetch the updated session so the AI sees the
+    # latest answer in the conversation history.
+    await save_answer(body.text, body.skip, session, body.duration)
+    session = await get_session(session_id)
+
+    if not session or session.is_time_up():
+        if session:
+            await mark_completed(session)
+        return {"type": "time_up"}
+
+    # Load custom questions from the job posting
+    app_doc  = await applications_col().find_one({"session_id": session_id})
+    job_doc  = await jobs_col().find_one(
+        {"job_id": (app_doc or {}).get("job_id")}
+    ) if app_doc else None
+    custom_q = (job_doc or {}).get("custom_questions", [])
+    language = getattr(session, "language", "en")
+
+    history        = build_conversation_history(session)
+    next_q_number  = session.current_index + 1
+    secs_remaining = session.seconds_remaining()
+
+    next_question = await generate_next_question(
+        job_title            = session.job_title,
+        job_description      = session.job_description,
+        resume_text          = session.resume_text,
+        conversation_history = history,
+        question_number      = next_q_number,
+        seconds_remaining    = secs_remaining,
+        language             = language,
+        custom_questions     = custom_q,
+    )
+
+    if not next_question or session.is_time_up():
+        await mark_completed(session)
+        return {"type": "time_up"}
+
+    await append_question(session, next_question)
+
+    return {
+        "type":              "question",
+        "text":              next_question,
+        "index":             next_q_number,
+        "seconds_remaining": int(session.seconds_remaining()),
+    }
+
+
+# ── 4. WebSocket — kept for reference, NOT used by the frontend ───────────────
+#
+#  Vercel kills Python serverless WebSocket connections at its function timeout,
+#  causing the frontend to hang on "Processing your answer" indefinitely.
+#  Use POST /answer/{session_id} instead (endpoint #3 above).
 
 @router.websocket("/ws/{session_id}")
 async def interview_websocket(websocket: WebSocket, session_id: str):
@@ -134,7 +211,6 @@ async def interview_websocket(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
-    # Load app/job metadata ONCE — never again per answer turn
     app_doc  = await applications_col().find_one({"session_id": session_id})
     job_doc  = await jobs_col().find_one(
         {"job_id": (app_doc or {}).get("job_id")}
@@ -175,27 +251,15 @@ async def interview_websocket(websocket: WebSocket, session_id: str):
                 await websocket.send_json({"type": "completed"})
                 break
 
-            # ── FIX 1: ignore ping and any other unknown message types ─────────
-            # The frontend sends { type: "ping" } every 20 s as a keep-warm.
-            # Without this guard the loop would fall through, re-fetch the
-            # session, then block on the next receive_json() — consuming the
-            # real "answer" message and leaving the candidate stuck on
-            # "Processing…" indefinitely.
             if msg_type not in ("answer", "skip"):
                 continue
-            # ─────────────────────────────────────────────────────────────────
 
             is_skip     = (msg_type == "skip")
             answer_text = data.get("text") if not is_skip else None
             duration    = data.get("duration")
 
-            # ── FIX 2: save answer FIRST, then fetch the updated session ──────
-            # Previously both ran in parallel via asyncio.gather, which meant
-            # get_session() could return a snapshot that did NOT yet include
-            # the answer just saved — giving the AI stale conversation history.
             await save_answer(answer_text, is_skip, session, duration)
             session = await get_session(session_id)
-            # ─────────────────────────────────────────────────────────────────
 
             if not session or session.is_time_up():
                 if session:
@@ -207,7 +271,6 @@ async def interview_websocket(websocket: WebSocket, session_id: str):
             next_q_number  = session.current_index + 1
             secs_remaining = session.seconds_remaining()
 
-            # custom_q and language already loaded above — no DB hit here
             next_question = await generate_next_question(
                 job_title            = session.job_title,
                 job_description      = session.job_description,
@@ -245,17 +308,9 @@ async def interview_websocket(websocket: WebSocket, session_id: str):
 
 
 async def _tick_loop(websocket: WebSocket, session_id: str) -> None:
-    """
-    Sends a timer tick every 25 s.
-
-    Vercel serverless functions are killed after ~30 s of inactivity on the
-    WebSocket. Ticking every 25 s keeps the connection alive AND keeps the
-    function warm so there is no cold-start penalty between answers.
-    (Previously ticked every 30 s — now 25 s to stay safely under the limit.)
-    """
     try:
         while True:
-            await asyncio.sleep(25)          # <── was 30, now 25 for Vercel
+            await asyncio.sleep(25)
             session = await get_session(session_id)
             if not session or session.status == InteriewStatusEnum.COMPLETED:
                 break
@@ -267,7 +322,7 @@ async def _tick_loop(websocket: WebSocket, session_id: str) -> None:
         pass
 
 
-# ── 4. Whisper transcription ──────────────────────────────────────────────────
+# ── 5. Whisper transcription ──────────────────────────────────────────────────
 
 @router.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
@@ -282,7 +337,7 @@ async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
     return {"transcript": transcript}
 
 
-# ── 5. Force-end fallback ─────────────────────────────────────────────────────
+# ── 6. Force-end fallback ─────────────────────────────────────────────────────
 
 @router.put("/end/{session_id}")
 async def end_interview(session_id: str):
@@ -293,7 +348,7 @@ async def end_interview(session_id: str):
     return {"interviewEnded": True}
 
 
-# ── 6. Report — generate, persist, email recruiter ───────────────────────────
+# ── 7. Report — generate, persist, email recruiter ───────────────────────────
 
 @router.get("/report/{session_id}")
 async def report(session_id: str):
@@ -301,8 +356,7 @@ async def report(session_id: str):
     Generate the AI report with NLP, persist it, then:
       - Email the full report to the recruiter who owns the job.
       - Send a Slack notification (if configured).
-      - Return only { report_id, message } to the frontend — the candidate
-        does NOT see the report; it goes to the recruiter's inbox.
+      - Return only { report_id, message } to the frontend.
     """
     session = await get_session(session_id)
     if not session:
