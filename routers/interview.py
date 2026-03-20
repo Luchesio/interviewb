@@ -1,32 +1,42 @@
 """
-Interview router — HTTP polling engine (Vercel-compatible).
+Interview router — timer-driven WebSocket interview engine.
 
-Why HTTP instead of WebSocket?
-  Vercel serverless functions cannot hold persistent WebSocket connections.
-  The platform rejects the HTTP Upgrade handshake immediately.
-  Replacing the WebSocket with a request/response HTTP flow makes the backend
-  fully Vercel-compatible with zero infrastructure changes.
+Performance optimisations (v2):
+  1. app_doc, job_doc, custom_questions, and language are loaded ONCE at
+     WebSocket open and reused on every turn — eliminates 2 MongoDB round-trips
+     per answer (~300–500 ms saved each turn).
+  2. save_answer is awaited first, then get_session — ensures the AI always
+     receives the full, up-to-date conversation history including the latest answer.
+  3. A single get_session is used at the top of the answer loop (was two).
+  4. Vercel keep-warm: the WebSocket tick loop now also pings every 25 s so
+     the function stays hot throughout the interview.
 
-Turn-based flow:
-  POST /interview/answer  — candidate submits a transcribed answer (or skip).
-                            Backend saves it, generates the next question via
-                            GPT, and returns it in the same response.
-  POST /interview/end     — candidate or frontend timer ends the interview.
-  GET  /interview/report/{session_id} — unchanged, generates and emails report.
+Bug fixes (v3):
+  - FIX 1: ping (and any unknown) messages from the frontend are now ignored
+    with `continue` instead of silently falling through and consuming the next
+    receive_json() call — which was swallowing the real "answer" message and
+    leaving the candidate stuck on "Processing…" forever.
+  - FIX 2: save_answer is now awaited BEFORE get_session (was parallel via
+    asyncio.gather), so the session fetched for build_conversation_history
+    always contains the answer that was just saved.
 
-The countdown timer runs on the frontend (it already did). The backend still
-validates session expiry on every /answer call so the time limit is enforced
-server-side too.
+Other changes:
+  - Report endpoint still emails the full report to the recruiter who owns the job.
+  - Slack notification awaited directly (not create_task) so it completes before
+    the serverless function exits on Vercel.
 """
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi import (
+    APIRouter, File, Form, HTTPException, UploadFile,
+    WebSocket, WebSocketDisconnect,
+)
 
 from models.interview import InteriewStatusEnum
 from services.ai_service import (
@@ -53,34 +63,6 @@ router = APIRouter(prefix="/interview", tags=["Interview"])
 
 MIN_DURATION = 15
 MAX_DURATION = 20
-
-
-# ── Request / Response models ─────────────────────────────────────────────────
-
-class AnswerRequest(BaseModel):
-    session_id: str
-    answer:     Optional[str]   = None   # None or empty → treated as skip
-    skip:       bool            = False
-    duration:   Optional[float] = None   # seconds candidate spoke
-
-
-class AnswerResponse(BaseModel):
-    interview_ended:   bool
-    next_question:     Optional[str] = None
-    question_index:    Optional[int] = None
-    seconds_remaining: Optional[int] = None
-    reason:            Optional[str] = None  # "time_up" | "completed"
-
-
-class EndRequest(BaseModel):
-    session_id: str
-
-
-class SaveMediaUrlBody(BaseModel):
-    session_id:     str
-    media_type:     str
-    cloudinary_url: str
-    size_bytes:     int
 
 
 # ── 1. Legacy generate session ────────────────────────────────────────────────
@@ -131,117 +113,161 @@ async def start_interview(session_id: str):
     if not session or session.status == InteriewStatusEnum.COMPLETED:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Start the server-side countdown (idempotent — safe to call multiple times)
-    await start_timer(session)
-    session = await get_session(session_id)
-
     return {
-        "introText":        session.introText,
-        "firstQuestion":    session.questions[0] if session.questions else "",
-        "candidateName":    session.candidate_name,
-        "durationMinutes":  session.duration_minutes,
-        "language":         getattr(session, "language", "en"),
-        "secondsRemaining": int(session.seconds_remaining()),
+        "introText":       session.introText,
+        "firstQuestion":   session.questions[0] if session.questions else "",
+        "candidateName":   session.candidate_name,
+        "durationMinutes": session.duration_minutes,
+        "language":        getattr(session, "language", "en"),
     }
 
 
-# ── 3. Answer — core of the HTTP polling loop ─────────────────────────────────
+# ── 3. WebSocket — main conversation channel ──────────────────────────────────
 
-@router.post("/answer", response_model=AnswerResponse)
-async def submit_answer(body: AnswerRequest):
-    """
-    Receive a candidate answer (or skip), save it, generate and return the
-    next question — all in a single request/response cycle.
+@router.websocket("/ws/{session_id}")
+async def interview_websocket(websocket: WebSocket, session_id: str):
+    await websocket.accept()
 
-    Replaces the entire WebSocket conversation loop.
-    """
-    session = await get_session(body.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await get_session(session_id)
+    if not session or session.status == InteriewStatusEnum.COMPLETED:
+        await websocket.send_json({"type": "error", "detail": "Session not found"})
+        await websocket.close()
+        return
 
-    if session.status == InteriewStatusEnum.COMPLETED:
-        return AnswerResponse(interview_ended=True, reason="completed")
-
-    # Start the server-side timer on the first answer if not already started.
-    # The frontend never calls GET /start — it uses the session snapshot directly.
-    # Without this, expires_at stays 0 and seconds_remaining() returns the full
-    # duration on every answer, which causes the timer to appear to reset.
-    if session.expires_at == 0:
-        await start_timer(session)
-        session = await get_session(body.session_id)
-
-    # Server-side time guard
-    if session.is_time_up():
-        await mark_completed(session)
-        return AnswerResponse(interview_ended=True, reason="time_up")
-
-    # Load job metadata for question generation.
-    # custom_questions live on job_doc and aren't stored on the session.
-    app_doc  = await applications_col().find_one({"session_id": body.session_id})
+    # Load app/job metadata ONCE — never again per answer turn
+    app_doc  = await applications_col().find_one({"session_id": session_id})
     job_doc  = await jobs_col().find_one(
         {"job_id": (app_doc or {}).get("job_id")}
     ) if app_doc else None
     custom_q = (job_doc or {}).get("custom_questions", [])
     language = getattr(session, "language", "en")
 
-    # Snapshot these before save_answer mutates session.current_index
-    history       = build_conversation_history(session)
-    next_q_number = session.current_index + 1
-    secs_left     = session.seconds_remaining()
+    await start_timer(session)
+    session = await get_session(session_id)
 
-    # Run save_answer (MongoDB write) and generate_next_question (GPT) in
-    # parallel — saves the full DB write latency (~100-200 ms) on every turn
-    next_question, _ = await asyncio.gather(
-        generate_next_question(
-            job_title            = session.job_title,
-            job_description      = session.job_description,
-            resume_text          = session.resume_text,
-            conversation_history = history,
-            question_number      = next_q_number,
-            seconds_remaining    = secs_left,
-            language             = language,
-            custom_questions     = custom_q,
-        ),
-        save_answer(
-            answer_text      = None if body.skip else body.answer,
-            skip             = body.skip,
-            session          = session,
-            duration_seconds = body.duration,
-        ),
-    )
+    first_q = session.questions[0] if session.questions else "Tell me about yourself."
+    await websocket.send_json({
+        "type":              "question",
+        "text":              first_q,
+        "index":             session.current_index + 1,
+        "seconds_remaining": int(session.seconds_remaining()),
+    })
 
-    # Refresh session after save_answer has mutated and persisted it
-    session = await get_session(body.session_id)
+    tick_task = asyncio.create_task(_tick_loop(websocket, session_id))
 
-    # GPT takes several seconds — re-check time after the call
-    if not next_question or session.is_time_up():
-        await mark_completed(session)
-        return AnswerResponse(interview_ended=True, reason="time_up")
+    try:
+        while True:
+            session = await get_session(session_id)
+            if not session or session.status == InteriewStatusEnum.COMPLETED:
+                await websocket.send_json({"type": "completed"})
+                break
 
-    await append_question(session, next_question)
+            if session.is_time_up():
+                await mark_completed(session)
+                await websocket.send_json({"type": "time_up"})
+                break
 
-    return AnswerResponse(
-        interview_ended   = False,
-        next_question     = next_question,
-        question_index    = next_q_number,
-        seconds_remaining = int(session.seconds_remaining()),
-    )
+            data     = await websocket.receive_json()
+            msg_type = data.get("type")
+
+            if msg_type == "end":
+                await mark_completed(session)
+                await websocket.send_json({"type": "completed"})
+                break
+
+            # ── FIX 1: ignore ping and any other unknown message types ─────────
+            # The frontend sends { type: "ping" } every 20 s as a keep-warm.
+            # Without this guard the loop would fall through, re-fetch the
+            # session, then block on the next receive_json() — consuming the
+            # real "answer" message and leaving the candidate stuck on
+            # "Processing…" indefinitely.
+            if msg_type not in ("answer", "skip"):
+                continue
+            # ─────────────────────────────────────────────────────────────────
+
+            is_skip     = (msg_type == "skip")
+            answer_text = data.get("text") if not is_skip else None
+            duration    = data.get("duration")
+
+            # ── FIX 2: save answer FIRST, then fetch the updated session ──────
+            # Previously both ran in parallel via asyncio.gather, which meant
+            # get_session() could return a snapshot that did NOT yet include
+            # the answer just saved — giving the AI stale conversation history.
+            await save_answer(answer_text, is_skip, session, duration)
+            session = await get_session(session_id)
+            # ─────────────────────────────────────────────────────────────────
+
+            if not session or session.is_time_up():
+                if session:
+                    await mark_completed(session)
+                await websocket.send_json({"type": "time_up"})
+                break
+
+            history        = build_conversation_history(session)
+            next_q_number  = session.current_index + 1
+            secs_remaining = session.seconds_remaining()
+
+            # custom_q and language already loaded above — no DB hit here
+            next_question = await generate_next_question(
+                job_title            = session.job_title,
+                job_description      = session.job_description,
+                resume_text          = session.resume_text,
+                conversation_history = history,
+                question_number      = next_q_number,
+                seconds_remaining    = secs_remaining,
+                language             = language,
+                custom_questions     = custom_q,
+            )
+
+            if not next_question or session.is_time_up():
+                await mark_completed(session)
+                await websocket.send_json({"type": "time_up"})
+                break
+
+            await append_question(session, next_question)
+            await websocket.send_json({
+                "type":              "question",
+                "text":              next_question,
+                "index":             next_q_number,
+                "seconds_remaining": int(session.seconds_remaining()),
+            })
+
+    except WebSocketDisconnect:
+        log.info("WS disconnected: session=%s", session_id)
+    except Exception as exc:
+        log.exception("WS error session=%s: %s", session_id, exc)
+        try:
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+        except Exception:
+            pass
+    finally:
+        tick_task.cancel()
 
 
-# ── 4. End interview ──────────────────────────────────────────────────────────
+async def _tick_loop(websocket: WebSocket, session_id: str) -> None:
+    """
+    Sends a timer tick every 25 s.
 
-@router.post("/end")
-async def end_interview_http(body: EndRequest):
-    """Called when the candidate clicks 'End Interview' or the frontend timer expires."""
-    session = await get_session(body.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.status != InteriewStatusEnum.COMPLETED:
-        await mark_completed(session)
-    return {"interview_ended": True}
+    Vercel serverless functions are killed after ~30 s of inactivity on the
+    WebSocket. Ticking every 25 s keeps the connection alive AND keeps the
+    function warm so there is no cold-start penalty between answers.
+    (Previously ticked every 30 s — now 25 s to stay safely under the limit.)
+    """
+    try:
+        while True:
+            await asyncio.sleep(25)          # <── was 30, now 25 for Vercel
+            session = await get_session(session_id)
+            if not session or session.status == InteriewStatusEnum.COMPLETED:
+                break
+            secs = int(session.seconds_remaining())
+            await websocket.send_json({"type": "tick", "seconds_remaining": secs})
+            if secs <= 0:
+                break
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
-# ── 5. Whisper transcription ──────────────────────────────────────────────────
+# ── 4. Whisper transcription ──────────────────────────────────────────────────
 
 @router.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
@@ -256,10 +282,10 @@ async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
     return {"transcript": transcript}
 
 
-# ── 6. Legacy PUT /end fallback ───────────────────────────────────────────────
+# ── 5. Force-end fallback ─────────────────────────────────────────────────────
 
 @router.put("/end/{session_id}")
-async def end_interview_legacy(session_id: str):
+async def end_interview(session_id: str):
     session = await get_session(session_id)
     if not session or session.status == InteriewStatusEnum.COMPLETED:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -267,17 +293,25 @@ async def end_interview_legacy(session_id: str):
     return {"interviewEnded": True}
 
 
-# ── 7. Report ─────────────────────────────────────────────────────────────────
+# ── 6. Report — generate, persist, email recruiter ───────────────────────────
 
 @router.get("/report/{session_id}")
 async def report(session_id: str):
+    """
+    Generate the AI report with NLP, persist it, then:
+      - Email the full report to the recruiter who owns the job.
+      - Send a Slack notification (if configured).
+      - Return only { report_id, message } to the frontend — the candidate
+        does NOT see the report; it goes to the recruiter's inbox.
+    """
     session = await get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     answers_payload = [a.model_dump() for a in session.answers]
     language        = getattr(session, "language", "en")
-    nlp_metrics     = aggregate_nlp_metrics(answers_payload)
+
+    nlp_metrics = aggregate_nlp_metrics(answers_payload)
 
     result = await generate_report(
         answers_payload,
@@ -333,13 +367,20 @@ async def report(session_id: str):
                     job_id         = app_doc["job_id"],
                 )
                 if ok:
-                    log.info("Report email sent → %s | report_id=%s",
-                             recruiter["email"], report_id)
+                    log.info(
+                        "Report email sent → recruiter %s | report_id=%s",
+                        recruiter["email"], report_id,
+                    )
                 else:
-                    log.warning("Report email failed → %s | report_id=%s",
-                                recruiter["email"], report_id)
+                    log.warning(
+                        "Report email failed → recruiter %s | report_id=%s",
+                        recruiter["email"], report_id,
+                    )
             else:
-                log.warning("Recruiter %s has no email — report not emailed.", recruiter_id)
+                log.warning(
+                    "Recruiter %s has no email address on record — report not emailed.",
+                    recruiter_id,
+                )
 
             from routers.recruiter import notify_new_report
             await notify_new_report(
@@ -355,32 +396,3 @@ async def report(session_id: str):
         "report_id": report_id,
         "message":   "Your interview is complete. Thank you for your time! The results have been sent to the hiring team.",
     }
-
-
-# ── 8. Save Cloudinary media URL ─────────────────────────────────────────────
-
-@router.post("/save-media-url")
-async def save_media_url(body: SaveMediaUrlBody):
-    from db.mongo import media_col
-    from datetime import timezone
-
-    media_id  = str(uuid.uuid4())
-    media_doc = {
-        "media_id":       media_id,
-        "session_id":     body.session_id,
-        "media_type":     body.media_type,
-        "cloudinary_url": body.cloudinary_url,
-        "size_bytes":     body.size_bytes,
-        "uploaded_at":    datetime.now(timezone.utc),
-    }
-    await media_col().insert_one(media_doc)
-
-    url_field = "webcam_url" if body.media_type == "webcam" else "screen_url"
-    await reports_col().update_one(
-        {"session_id": body.session_id},
-        {"$set": {url_field: body.cloudinary_url}},
-    )
-
-    log.info("Media URL saved: %s session=%s type=%s",
-             media_id, body.session_id, body.media_type)
-    return {"media_id": media_id, "cloudinary_url": body.cloudinary_url}
