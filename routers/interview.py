@@ -144,6 +144,11 @@ async def submit_answer(session_id: str, body: AnswerRequest):
     if session.status == InteriewStatusEnum.COMPLETED:
         return {"type": "completed"}
 
+    # Defensive: start the server-side timer if it hasn't been started yet.
+    # start_timer is idempotent — it only writes when expires_at == 0.
+    # This covers paths (e.g. verify-token flow) that bypass GET /start/.
+    await start_timer(session)
+
     if session.is_time_up():
         await mark_completed(session)
         return {"type": "time_up"}
