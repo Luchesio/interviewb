@@ -2,15 +2,11 @@
 Candidate router — public endpoints.
 
 POST /apply                              – submit application
+GET  /jobs/{job_id}/public               – public job details for apply page
 GET  /interview/verify?token=xxx         – validate token → load session
 GET  /candidate/applications?email=x     – candidate dashboard
 POST /interview/upload-media             – upload recording to Cloudinary
 GET  /interview/media/{media_id}         – redirect to Cloudinary URL
-
-Recording storage:
-  Videos (webcam + screen share) are uploaded directly to Cloudinary.
-  Only the Cloudinary secure_url is stored in MongoDB — no binary data
-  ever touches the database, keeping MongoDB usage minimal.
 """
 
 import uuid
@@ -36,16 +32,40 @@ TOKEN_TTL_HOURS   = 72
 FIT_EMAIL_DELAY_M = 10
 
 
+# ── 0. Public job details (no auth) ──────────────────────────────────────────
+
+@router.get("/jobs/{job_id}/public")
+async def get_public_job(job_id: str):
+    """
+    Public endpoint — returns minimal job info needed to render the apply page.
+    No authentication required.  Only active jobs are returned.
+    """
+    doc = await jobs_col().find_one(
+        {"job_id": job_id, "is_active": True},
+        {"_id": 0, "job_id": 1, "job_title": 1, "job_description": 1},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found or no longer active")
+    return doc
+
+
 # ── 1. Candidate applies ──────────────────────────────────────────────────────
 
 @router.post("/apply", status_code=201)
 async def apply(
-    job_id:           str        = Form(...),
-    candidate_name:   str        = Form(...),
-    candidate_email:  str        = Form(...),
-    resume:           UploadFile = File(...),
-    duration_minutes: int        = Form(15),
-    language:         str        = Form("en"),
+    job_id:            str        = Form(...),
+    candidate_name:    str        = Form(...),
+    candidate_email:   str        = Form(...),
+    resume:            UploadFile = File(...),
+    duration_minutes:  int        = Form(15),
+    language:          str        = Form("en"),
+    # ── New fields ────────────────────────────────────────────────────────────
+    phone:             str        = Form(""),
+    linkedin_url:      str        = Form(""),
+    portfolio_url:     str        = Form(""),
+    years_experience:  str        = Form(""),
+    current_location:  str        = Form(""),
+    cover_letter:      str        = Form(""),
 ):
     job = await jobs_col().find_one({"job_id": job_id, "is_active": True})
     if not job:
@@ -67,6 +87,16 @@ async def apply(
         candidate_email, job_id, is_fit, score,
     )
 
+    # Extra fields dict — stored alongside the application
+    extra_fields = {
+        "phone":            phone,
+        "linkedin_url":     linkedin_url,
+        "portfolio_url":    portfolio_url,
+        "years_experience": years_experience,
+        "current_location": current_location,
+        "cover_letter":     cover_letter,
+    }
+
     if not is_fit:
         application = Application(
             application_id  = str(uuid.uuid4()),
@@ -78,7 +108,9 @@ async def apply(
             status          = ApplicationStatus.REJECTED,
             language        = language,
         )
-        await applications_col().insert_one(application.model_dump())
+        app_doc = application.model_dump()
+        app_doc.update(extra_fields)
+        await applications_col().insert_one(app_doc)
 
         ok = await send_candidate_fit_email(
             to_email       = candidate_email,
@@ -129,7 +161,9 @@ async def apply(
         status          = ApplicationStatus.INVITED,
         language        = language,
     )
-    await applications_col().insert_one(application.model_dump())
+    app_doc = application.model_dump()
+    app_doc.update(extra_fields)
+    await applications_col().insert_one(app_doc)
 
     raw_token  = str(uuid.uuid4()) + str(uuid.uuid4()).replace("-", "")
     expires_at = datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)
@@ -234,79 +268,52 @@ async def get_candidate_applications(email: str):
                     "report_id": 1,
                     "report.score": 1,
                     "report.hiring_recommendation": 1,
-                    "report.soft_skills.communication_score": 1,
-                    "report.soft_skills.confidence": 1,
-                    "created_at": 1,
                 },
             )
-            entry["report_summary"] = report_doc if report_doc else None
-        else:
-            entry["report_summary"] = None
-
+            if report_doc:
+                entry["report_id"]              = report_doc.get("report_id")
+                entry["score"]                  = report_doc.get("report", {}).get("score")
+                entry["hiring_recommendation"]  = report_doc.get("report", {}).get("hiring_recommendation")
         enriched.append(entry)
 
-    return {"email": email, "applications": enriched, "total": len(enriched)}
+    return {"applications": enriched}
 
 
-# ── 4. Save media URL — frontend uploads directly to Cloudinary ──────────────
-#
-# Video blobs exceed Vercel's 4.5 MB serverless function limit so they must
-# never pass through this server.  The Angular frontend uploads the blob
-# straight to Cloudinary (unsigned preset) and then sends only the resulting
-# URL here.  This endpoint stores that URL in MongoDB — a tiny JSON payload
-# that is well within all platform limits.
+# ── 4. Upload recording to Cloudinary ────────────────────────────────────────
 
-class SaveMediaUrlRequest(BaseModel):
-    session_id:     str
-    media_type:     str           # "webcam" | "screen"
-    cloudinary_url: str
-    size_bytes:     int = 0
+@router.post("/interview/upload-media")
+async def upload_media(
+    session_id:  str        = Form(...),
+    media_type:  str        = Form("webcam"),
+    file:        UploadFile = File(...),
+):
+    from services.cloudinary_service import upload_video
+    import uuid as _uuid
 
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-@router.post("/interview/save-media-url", status_code=201)
-async def save_media_url(body: SaveMediaUrlRequest):
-    """
-    Persist the Cloudinary URL returned by a direct browser → Cloudinary upload.
-    No file data passes through this endpoint — only a short URL string.
-    """
-    if not body.cloudinary_url.startswith("https://res.cloudinary.com/"):
-        raise HTTPException(status_code=400, detail="Invalid Cloudinary URL.")
+    url = await upload_video(content, filename=file.filename or "recording.webm")
 
-    media_id  = str(uuid.uuid4())
+    media_id  = str(_uuid.uuid4())
     media_doc = {
-        "media_id":       media_id,
-        "session_id":     body.session_id,
-        "media_type":     body.media_type,
-        "cloudinary_url": body.cloudinary_url,
-        "size_bytes":     body.size_bytes,
-        "uploaded_at":    datetime.now(timezone.utc),
+        "media_id":   media_id,
+        "session_id": session_id,
+        "media_type": media_type,
+        "url":        url,
+        "created_at": datetime.now(timezone.utc),
     }
     await media_col().insert_one(media_doc)
-
-    url_field = "webcam_url" if body.media_type == "webcam" else "screen_url"
-    await reports_col().update_one(
-        {"session_id": body.session_id},
-        {"$set": {url_field: body.cloudinary_url}},
-    )
-
-    log.info(
-        "Media URL saved: %s session=%s type=%s",
-        media_id, body.session_id, body.media_type,
-    )
-    return {"media_id": media_id, "cloudinary_url": body.cloudinary_url}
+    log.info("Media uploaded: media_id=%s session=%s type=%s", media_id, session_id, media_type)
+    return {"media_id": media_id, "url": url}
 
 
-# ── 5. Get media — redirect to Cloudinary URL ────────────────────────────────
+# ── 5. Redirect to Cloudinary URL ────────────────────────────────────────────
 
 @router.get("/interview/media/{media_id}")
-async def get_media_url(media_id: str):
-    """Redirect to the Cloudinary URL — video streams directly from Cloudinary."""
-    media_doc = await media_col().find_one({"media_id": media_id})
-    if not media_doc:
+async def get_media(media_id: str):
+    doc = await media_col().find_one({"media_id": media_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="Media not found")
-
-    cloudinary_url = media_doc.get("cloudinary_url")
-    if not cloudinary_url:
-        raise HTTPException(status_code=404, detail="Recording URL not available")
-
-    return RedirectResponse(url=cloudinary_url, status_code=302)
+    return RedirectResponse(url=doc["url"])
