@@ -31,8 +31,16 @@ log = logging.getLogger(__name__)
 
 RESEND_API_KEY   = os.getenv("RESEND_API_KEY", "")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-EMAIL_FROM       = os.getenv("EMAIL_FROM", "noreply@yourdomain.com")
-APP_BASE_URL     = os.getenv("APP_BASE_URL", "http://localhost:4200")
+
+# Separate verified senders on the ingenium.name.ng domain:
+#   • candidate-facing mail (invites, fit/no-fit) → invite@ingenium.name.ng
+#   • recruiter-facing mail (weekly digest)       → info@ingenium.name.ng
+# Both are overridable via env. EMAIL_FROM is kept for backward compatibility
+# and defaults to the candidate sender.
+EMAIL_FROM_CANDIDATE = os.getenv("EMAIL_FROM_CANDIDATE", "Ingenium Recruitment <invite@ingenium.name.ng>")
+EMAIL_FROM_RECRUITER = os.getenv("EMAIL_FROM_RECRUITER", "Ingenium <info@ingenium.name.ng>")
+EMAIL_FROM           = os.getenv("EMAIL_FROM", EMAIL_FROM_CANDIDATE)
+APP_BASE_URL         = os.getenv("APP_BASE_URL", "http://localhost:4200")
 
 # ---------------------------------------------------------------------------
 # Minified CSS — Ingenium design system (navy #0F213A · gold #C5A059 · white)
@@ -347,6 +355,83 @@ async def send_report_to_recruiter(
         _build_report_html(recruiter_name, candidate_name,
                            job_title, report, report_id, job_id),
         dev_label=f"recruiter_report → {to_email} | candidate={candidate_name}",
+        from_email=EMAIL_FROM_RECRUITER,
+    )
+
+
+# ── 4. Recruiter weekly digest ───────────────────────────────────────────────
+
+def _build_weekly_digest_html(recruiter_name: str, period_label: str,
+                              rows: list[dict], totals: dict) -> str:
+    fn = _first(recruiter_name)
+
+    if rows:
+        body_rows = "".join(
+            f'<tr>'
+            f'<td>{r.get("job_title", "—")}</td>'
+            f'<td style="text-align:center"><strong>{r.get("interviewed", 0)}</strong></td>'
+            f'<td style="text-align:center">{r.get("applied", 0)}</td>'
+            f'</tr>'
+            for r in rows
+        )
+    else:
+        body_rows = '<tr><td colspan="3">No active job postings.</td></tr>'
+
+    dash_url = f"{APP_BASE_URL}/recruiter/jobs"
+
+    return (
+        f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        f'<style>{_CSS_RECRUITER}</style></head><body>'
+        f'<div class="w">'
+        f'<div class="hd">'
+        f'<div style="font-size:.68rem;color:#C5A059;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px">Ingenium &mdash; Weekly Summary</div>'
+        f'<h1>Your hiring activity &mdash; {period_label}</h1>'
+        f'</div>'
+        f'<div class="bd">'
+        f'<p>Dear <strong>{fn}</strong>,</p>'
+        f'<p>Here is your hiring activity across all job postings for the past week.</p>'
+        f'<table role="presentation" style="width:100%;border-collapse:separate;border-spacing:10px 0;margin:4px 0 18px">'
+        f'<tr>'
+        f'<td style="width:50%;background:#F4F6F8;border:1px solid #E2E8F0;border-radius:8px;padding:16px;text-align:center">'
+        f'<div style="font-size:1.9rem;font-weight:700;color:#0F213A;line-height:1">{totals.get("applied", 0)}</div>'
+        f'<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:#6C7A89;margin-top:6px">New Applications</div>'
+        f'</td>'
+        f'<td style="width:50%;background:#F4F6F8;border:1px solid #E2E8F0;border-radius:8px;padding:16px;text-align:center">'
+        f'<div style="font-size:1.9rem;font-weight:700;color:#0F213A;line-height:1">{totals.get("interviewed", 0)}</div>'
+        f'<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:#6C7A89;margin-top:6px">Interviews Completed</div>'
+        f'</td>'
+        f'</tr></table>'
+        f'<p class="lbl">Breakdown by job posting</p>'
+        f'<table><thead><tr>'
+        f'<th>Job Posting</th><th style="text-align:center">Interviewed</th>'
+        f'<th style="text-align:center">New Applicants</th>'
+        f'</tr></thead><tbody>{body_rows}</tbody></table>'
+        f'<p>Open your dashboard to review each candidate&rsquo;s full report.</p>'
+        f'<a class="btn" href="{dash_url}">View Dashboard &rarr;</a>'
+        f'<p class="note">Direct link: <a href="{dash_url}">{dash_url}</a></p>'
+        f'<p>Kind regards,<br><strong>The Ingenium Platform</strong></p>'
+        f'</div>'
+        f'<div class="ft">'
+        f'Ingenium AI Interview Platform &nbsp;&bull;&nbsp; Weekly recruiter summary'
+        f'</div>'
+        f'</div></body></html>'
+    )
+
+
+async def send_weekly_digest_to_recruiter(
+    to_email:       str,
+    recruiter_name: str,
+    period_label:   str,
+    rows:           list[dict],
+    totals:         dict,
+) -> bool:
+    """Email a recruiter the weekly count of candidates per job posting."""
+    subject = f"Your Weekly Hiring Summary — {period_label}"
+    return await _dispatch(
+        to_email, subject,
+        _build_weekly_digest_html(recruiter_name, period_label, rows, totals),
+        dev_label=f"weekly_digest → {to_email} ({len(rows)} jobs)",
+        from_email=EMAIL_FROM_RECRUITER,
     )
 
 
@@ -389,14 +474,15 @@ async def _dispatch(
     html:         str,
     dev_label:    str = "",
     scheduled_at: "datetime | None" = None,
+    from_email:   str = EMAIL_FROM_CANDIDATE,
 ) -> bool:
     if RESEND_API_KEY:
         # Scheduled sends go directly — no retry loop needed because if the
         # API call itself succeeds, Resend owns the delivery from that point.
         if scheduled_at:
-            return await _send_via_resend(to, subject, html, scheduled_at=scheduled_at)
+            return await _send_via_resend(to, subject, html, scheduled_at=scheduled_at, from_email=from_email)
         return await _with_retry(
-            lambda: _send_via_resend(to, subject, html),
+            lambda: _send_via_resend(to, subject, html, from_email=from_email),
             label=f"resend→{to}",
         )
     if SENDGRID_API_KEY:
@@ -404,11 +490,20 @@ async def _dispatch(
         if scheduled_at:
             log.info("[EMAIL] SendGrid fallback: scheduled_at ignored, sending immediately to %s", to)
         return await _with_retry(
-            lambda: _send_via_sendgrid(to, subject, html),
+            lambda: _send_via_sendgrid(to, subject, html, from_email=from_email),
             label=f"sendgrid→{to}",
         )
-    log.warning("[EMAIL DEV] %s | Subject: %s", dev_label, subject)
+    log.warning("[EMAIL DEV] %s | From: %s | Subject: %s", dev_label, from_email, subject)
     return True
+
+
+def _parse_from(from_str: str) -> tuple[str, str | None]:
+    """Split a 'Display Name <addr@x>' string into (email, name)."""
+    if "<" in from_str and ">" in from_str:
+        name = from_str.split("<", 1)[0].strip().strip('"')
+        addr = from_str.split("<", 1)[1].split(">", 1)[0].strip()
+        return addr, (name or None)
+    return from_str.strip(), None
 
 
 async def _send_via_resend(
@@ -416,9 +511,10 @@ async def _send_via_resend(
     subject:      str,
     html:         str,
     scheduled_at: "datetime | None" = None,
+    from_email:   str = EMAIL_FROM_CANDIDATE,
 ) -> bool:
     payload: dict = {
-        "from":    EMAIL_FROM,
+        "from":    from_email,
         "to":      [to],
         "subject": subject,
         "html":    html,
@@ -449,10 +545,15 @@ async def _send_via_resend(
     return False
 
 
-async def _send_via_sendgrid(to: str, subject: str, html: str) -> bool:
+async def _send_via_sendgrid(to: str, subject: str, html: str,
+                             from_email: str = EMAIL_FROM_CANDIDATE) -> bool:
+    addr, name = _parse_from(from_email)
+    from_obj   = {"email": addr}
+    if name:
+        from_obj["name"] = name
     payload = {
         "personalizations": [{"to": [{"email": to}]}],
-        "from":    {"email": EMAIL_FROM},
+        "from":    from_obj,
         "subject": subject,
         "content": [{"type": "text/html", "value": html}],
     }

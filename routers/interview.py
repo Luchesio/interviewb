@@ -22,12 +22,14 @@ Other notes:
 
 import asyncio
 import logging
+import os
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, UploadFile,
+    APIRouter, File, Form, HTTPException, UploadFile, Header,
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import Response
@@ -536,26 +538,11 @@ async def ensure_report(session_id: str) -> dict:
             job_doc = await jobs_col().find_one({"job_id": app_doc["job_id"]})
             if job_doc:
                 recruiter_id = job_doc.get("recruiter_id", "")
-                recruiter    = await users_col().find_one({"user_id": recruiter_id})
 
-                if recruiter and recruiter.get("email"):
-                    from services.email_service import send_report_to_recruiter
-                    ok = await send_report_to_recruiter(
-                        to_email       = recruiter["email"],
-                        recruiter_name = recruiter.get("name") or recruiter.get("email", "Recruiter"),
-                        candidate_name = app_doc["candidate_name"],
-                        job_title      = session.job_title,
-                        report         = result,
-                        report_id      = report_id,
-                        job_id         = app_doc["job_id"],
-                    )
-                    if ok:
-                        log.info("Report email sent → recruiter %s | report_id=%s", recruiter["email"], report_id)
-                    else:
-                        log.warning("Report email failed → recruiter %s | report_id=%s", recruiter["email"], report_id)
-                else:
-                    log.warning("Recruiter %s has no email on record — report not emailed.", recruiter_id)
-
+                # Per-candidate report emails were replaced by a weekly digest
+                # (see POST /recruiter/weekly-digest). The full report remains
+                # available on the recruiter dashboard. We still fire the
+                # real-time Slack notification if the recruiter configured one.
                 from routers.recruiter import notify_new_report
                 await notify_new_report(
                     job_id         = app_doc["job_id"],
@@ -590,8 +577,14 @@ async def report(session_id: str):
 #  Point a scheduled trigger (e.g. Vercel Cron) at this endpoint to generate the
 #  reports for any timed-out, still-in-progress sessions.
 
-@router.post("/sweep-expired")
-async def sweep_expired():
+@router.api_route("/sweep-expired", methods=["GET", "POST"])
+async def sweep_expired(authorization: Optional[str] = Header(default=None)):
+    # Vercel Cron invokes this with GET. If CRON_SECRET is set, Vercel adds an
+    # "Authorization: Bearer <CRON_SECRET>" header which we verify here.
+    cron_secret = os.getenv("CRON_SECRET", "")
+    if cron_secret and authorization != f"Bearer {cron_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     now       = time.time()
     finalized = []
     cursor = sessions_col().find(

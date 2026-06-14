@@ -12,18 +12,20 @@ POST /recruiter/webhooks                   – configure Slack webhook URL
 POST /recruiter/webhooks/test              – send test Slack notification
 """
 
+import os
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, HttpUrl
 
-from db.mongo import jobs_col, reports_col, users_col
+from db.mongo import jobs_col, reports_col, users_col, applications_col
 from models.job import Job
 from dependencies.auth import get_current_recruiter, CurrentRecruiter
+from services.email_service import send_weekly_digest_to_recruiter
 
 log    = logging.getLogger(__name__)
 router = APIRouter(prefix="/recruiter", tags=["Recruiter"])
@@ -325,3 +327,79 @@ async def notify_new_report(job_id: str, candidate_name: str, job_title: str, re
         f"• *Job ID:* `{job_id}`"
     )
     await _send_slack_notification(webhook_url, text)
+
+
+# ── Weekly digest (cron target) ───────────────────────────────────────────────
+#
+#  Sends each recruiter a once-a-week summary of how many candidates took an
+#  interview (and how many newly applied) per job posting over the last 7 days.
+#  Replaces the old per-candidate report emails. Point a scheduled trigger
+#  (e.g. Vercel Cron, weekly) at POST /recruiter/weekly-digest.
+#
+#  If the CRON_SECRET env var is set, the request must include a matching
+#  `Authorization: Bearer <CRON_SECRET>` header (Vercel Cron can supply this).
+
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+DIGEST_WINDOW_DAYS = 7
+
+
+@router.api_route("/weekly-digest", methods=["GET", "POST"])
+async def send_weekly_digest(authorization: Optional[str] = Header(default=None)):
+    if CRON_SECRET:
+        if authorization != f"Bearer {CRON_SECRET}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    cutoff = datetime.utcnow() - timedelta(days=DIGEST_WINDOW_DAYS)
+    period_label = f"{cutoff.strftime('%b %d')} – {datetime.utcnow().strftime('%b %d, %Y')}"
+
+    # Recruiters who actually own at least one job posting.
+    recruiter_ids = await jobs_col().distinct("recruiter_id")
+
+    sent, skipped = 0, 0
+    for recruiter_id in recruiter_ids:
+        recruiter = await users_col().find_one({"user_id": recruiter_id})
+        if not recruiter or not recruiter.get("email"):
+            skipped += 1
+            continue
+
+        jobs = await jobs_col().find(
+            {"recruiter_id": recruiter_id, "is_active": True},
+            {"_id": 0, "job_id": 1, "job_title": 1},
+        ).to_list(length=500)
+
+        rows, totals = [], {"interviewed": 0, "applied": 0}
+        for job in jobs:
+            jid = job["job_id"]
+            interviewed = await reports_col().count_documents(
+                {"job_id": jid, "created_at": {"$gte": cutoff}}
+            )
+            applied = await applications_col().count_documents(
+                {"job_id": jid, "created_at": {"$gte": cutoff}}
+            )
+            rows.append({
+                "job_title":   job.get("job_title", "—"),
+                "interviewed": interviewed,
+                "applied":     applied,
+            })
+            totals["interviewed"] += interviewed
+            totals["applied"]     += applied
+
+        if not rows:
+            skipped += 1
+            continue
+
+        ok = await send_weekly_digest_to_recruiter(
+            to_email       = recruiter["email"],
+            recruiter_name = recruiter.get("name") or recruiter.get("email", "Recruiter"),
+            period_label   = period_label,
+            rows           = rows,
+            totals         = totals,
+        )
+        if ok:
+            sent += 1
+        else:
+            skipped += 1
+            log.warning("Weekly digest failed for recruiter %s", recruiter_id)
+
+    log.info("Weekly digest run complete: sent=%d skipped=%d", sent, skipped)
+    return {"sent": sent, "skipped": skipped, "period": period_label}
