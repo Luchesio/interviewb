@@ -323,26 +323,68 @@ async def upload_media(
     media_type:  str        = Form("webcam"),
     file:        UploadFile = File(...),
 ):
-    from services.cloudinary_service import upload_video
-    import uuid as _uuid
+    """Server-side upload fallback. The primary path is a direct browser upload
+    followed by POST /interview/save-media-url."""
+    from services.cloudinary_service import upload_recording
 
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    url = await upload_video(content, filename=file.filename or "recording.webm")
+    url = await upload_recording(
+        content,
+        filename   = file.filename or "recording.webm",
+        session_id = session_id,
+        media_type = media_type,
+    )
+    if not url:
+        raise HTTPException(status_code=502, detail="Cloudinary upload failed")
 
-    media_id  = str(_uuid.uuid4())
-    media_doc = {
-        "media_id":   media_id,
-        "session_id": session_id,
-        "media_type": media_type,
-        "url":        url,
-        "created_at": datetime.now(timezone.utc),
-    }
-    await media_col().insert_one(media_doc)
-    log.info("Media uploaded: media_id=%s session=%s type=%s", media_id, session_id, media_type)
-    return {"media_id": media_id, "url": url}
+    await _persist_media_url(session_id, media_type, url, len(content))
+    log.info("Media uploaded (server): session=%s type=%s", session_id, media_type)
+    return {"url": url}
+
+
+# ── 4b. Persist a directly-uploaded Cloudinary URL ───────────────────────────
+
+class SaveMediaUrl(BaseModel):
+    session_id:     str
+    media_type:     str = "webcam"
+    cloudinary_url: str
+    size_bytes:     Optional[int] = None
+
+
+async def _persist_media_url(session_id: str, media_type: str,
+                             url: str, size_bytes: Optional[int]) -> str:
+    """Upsert one recording URL per (session, media_type) so re-uploads overwrite."""
+    media_id = str(uuid.uuid4())
+    await media_col().update_one(
+        {"session_id": session_id, "media_type": media_type},
+        {"$set": {
+            "media_id":   media_id,
+            "session_id": session_id,
+            "media_type": media_type,
+            "url":        url,
+            "size_bytes": size_bytes,
+            "created_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    return media_id
+
+
+@router.post("/interview/save-media-url")
+async def save_media_url(payload: SaveMediaUrl):
+    """Called by the browser after a direct-to-Cloudinary upload to persist the
+    resulting secure URL so the recruiter can play the recording back."""
+    if not payload.cloudinary_url:
+        raise HTTPException(status_code=400, detail="cloudinary_url is required")
+    media_id = await _persist_media_url(
+        payload.session_id, payload.media_type,
+        payload.cloudinary_url, payload.size_bytes,
+    )
+    log.info("Media URL saved: session=%s type=%s", payload.session_id, payload.media_type)
+    return {"media_id": media_id, "saved": True}
 
 
 # ── 5. Redirect to Cloudinary URL ────────────────────────────────────────────

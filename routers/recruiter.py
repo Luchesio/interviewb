@@ -22,7 +22,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, HttpUrl
 
-from db.mongo import jobs_col, reports_col, users_col, applications_col
+from db.mongo import jobs_col, reports_col, users_col, applications_col, media_col
 from models.job import Job
 from dependencies.auth import get_current_recruiter, CurrentRecruiter
 from services.email_service import send_weekly_digest_to_recruiter
@@ -135,6 +135,19 @@ async def get_full_report(report_id: str, current: CurrentRecruiter):
     doc = await reports_col().find_one({"report_id": report_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Report not found")
+
+    # Recording URLs are stored separately in media_col (one per webcam/screen),
+    # keyed by session_id — attach them so the recruiter can play them back.
+    session_id = doc.get("session_id")
+    if session_id:
+        async for m in media_col().find(
+            {"session_id": session_id}, {"_id": 0, "media_type": 1, "url": 1}
+        ):
+            if m.get("media_type") == "screen":
+                doc["screen_url"] = m.get("url")
+            else:
+                doc["webcam_url"] = m.get("url")
+
     return doc
 
 
