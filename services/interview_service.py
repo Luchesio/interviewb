@@ -58,7 +58,10 @@ async def save_answer(
     duration_seconds: Optional[float] = None,
 ) -> None:
     question = session.questions[session.current_index]
-    metrics  = analyse_answer(None if skip else answer_text)
+    metrics  = analyse_answer(
+        None if skip else answer_text,
+        language=getattr(session, "language", "en"),
+    )
 
     session.answers.append(Answer(
         question                = question,

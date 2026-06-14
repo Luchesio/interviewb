@@ -1,33 +1,70 @@
 """
-AI service layer — supports multi-language interviews, custom questions,
-and resume-to-job screening.
+AI service layer — Gemini edition.
 
-Performance optimisations (v2):
-  - generate_next_question now truncates job_description and resume_text before
-    embedding them in the prompt. Sending the full documents on every turn was
-    the single largest source of latency (extra tokens → more time-to-first-token
-    from GPT). Truncating to ~600 / ~800 chars cuts input tokens by ~60–70 %
-    and typically saves 3–6 seconds per turn with no meaningful quality loss —
-    the first question already used the full context; subsequent questions only
-    need a reminder of the role and key skills.
-  - The conversation history sent to GPT is capped at the last 6 turns. Beyond
-    that the model rarely changes its question anyway, and shorter context means
-    faster inference.
-  - Temperature lowered slightly (0.5 → 0.45) to reduce sampling variance and
-    shorten average output length.
+Supports multi-language interviews, custom questions, resume-to-job screening,
+speech-to-text (STT) and text-to-speech (TTS) — all powered by Google Gemini
+via the `google-genai` SDK.
+
+Migration notes (OpenAI → Gemini):
+  - Text + JSON tasks (resume screen, question generation, report) now use a
+    single Gemini model (default ``gemini-3.5-flash``) through one helper,
+    ``_generate_json``. OpenAI's ``response_format={"type": "json_object"}`` maps
+    to Gemini's ``response_mime_type="application/json"`` (+ an optional
+    ``response_schema`` for the flat payloads, which guarantees well-formed JSON).
+  - STT: Whisper is replaced by Gemini audio understanding. Per Google's guidance
+    we send audio **inline** when the request is below the 20 MB limit and fall
+    back to the **Files API upload** for anything larger. Interview answers are a
+    few seconds long, so the inline path is taken in practice; the upload path is
+    a safety net.
+  - TTS: previously the browser's Web Speech API spoke each question client-side.
+    We now generate natural speech server-side with ``gemini-3.1-flash-tts-preview``
+    and stream WAV audio to the browser. The frontend keeps the browser voice as
+    an automatic fallback if this endpoint is unavailable.
+
+Performance optimisations carried over from the OpenAI version:
+  - generate_next_question truncates job_description / resume_text and caps the
+    conversation history sent to the model, cutting input tokens and latency.
+
+Environment variables:
+  GEMINI_API_KEY      — required (the SDK also accepts GOOGLE_API_KEY).
+  GEMINI_TEXT_MODEL   — optional, default "gemini-3.5-flash".
+  GEMINI_STT_MODEL    — optional, default "gemini-3.5-flash".
+  GEMINI_TTS_MODEL    — optional, default "gemini-3.1-flash-tts-preview".
+  GEMINI_TTS_VOICE    — optional, default "Kore".
 """
 
-import json
 import io
+import os
+import json
+import wave
+import base64
 import logging
+import tempfile
 from typing import List, Optional
 
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
-log    = logging.getLogger(__name__)
-client = AsyncOpenAI()
+log = logging.getLogger(__name__)
+
+# The SDK reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
+client = genai.Client()
+
+# ── Model configuration (override via env without touching code) ──────────────
+TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")
+STT_MODEL  = os.getenv("GEMINI_STT_MODEL",  "gemini-3.5-flash")
+TTS_MODEL  = os.getenv("GEMINI_TTS_MODEL",  "gemini-3.1-flash-tts-preview")
+TTS_VOICE  = os.getenv("GEMINI_TTS_VOICE",  "Kore")
+
+# Google's documented threshold for inline audio vs. the Files API upload.
+_INLINE_AUDIO_LIMIT = 20 * 1024 * 1024  # 20 MB
+
+# TTS output is raw PCM: 16-bit, 24 kHz, mono.
+_TTS_SAMPLE_RATE  = 24_000
+_TTS_SAMPLE_WIDTH = 2
+_TTS_CHANNELS     = 1
 
 # Language code → full name mapping
 _LANGUAGE_NAMES = {
@@ -44,9 +81,74 @@ _LANGUAGE_NAMES = {
     "ig": "Igbo",
 }
 
+# Language code → BCP-47 tag for TTS. Gemini auto-detects language from the text,
+# so this is a hint only; unknown codes simply fall through to auto-detection.
+_LANGUAGE_BCP47 = {
+    "en": "en-US",
+    "fr": "fr-FR",
+    "es": "es-ES",
+    "de": "de-DE",
+    "pt": "pt-BR",
+    "ar": "ar-XA",
+    "zh": "cmn-CN",
+    "hi": "hi-IN",
+}
+
 
 def _lang_name(code: str) -> str:
     return _LANGUAGE_NAMES.get(code.lower(), code)
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+async def _generate_json(
+    prompt:      str,
+    *,
+    schema:      Optional[type] = None,
+    temperature: float          = 0.4,
+) -> dict:
+    """
+    Run a single-turn Gemini generation that returns strict JSON.
+
+    `prompt` must instruct the model to emit JSON (every caller below does).
+    When `schema` (a Pydantic model) is supplied the SDK constrains generation to
+    that shape — used for the flat payloads. The report payload has nullable
+    nested fields, so it relies on the prompt alone (no schema).
+    """
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=temperature,
+    )
+    if schema is not None:
+        config.response_schema = schema
+
+    resp = await client.aio.models.generate_content(
+        model=TEXT_MODEL,
+        contents=prompt,
+        config=config,
+    )
+
+    text = (resp.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned an empty response (possibly blocked).")
+    return json.loads(text)
+
+
+def _pcm_to_wav(
+    pcm:          bytes,
+    *,
+    channels:     int = _TTS_CHANNELS,
+    rate:         int = _TTS_SAMPLE_RATE,
+    sample_width: int = _TTS_SAMPLE_WIDTH,
+) -> bytes:
+    """Wrap raw little-endian PCM (what the TTS model returns) in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
 
 
 # ── Shared interviewer persona ─────────────────────────────────────────────────
@@ -95,7 +197,7 @@ async def screen_resume(
 
     The threshold for is_fit is a score >= 60.
     """
-    system_prompt = f"""
+    prompt = f"""
 You are an expert technical recruiter. Your task is to evaluate how well a
 candidate's resume matches a given job posting.
 
@@ -127,13 +229,7 @@ Return STRICT JSON — no markdown, no extra keys:
 }}
 """.strip()
 
-    resp = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt}],
-        temperature=0.2,
-    )
-    data = json.loads(resp.choices[0].message.content)
+    data = await _generate_json(prompt, temperature=0.2)
 
     score  = int(data.get("score", 0))
     is_fit = bool(data.get("is_fit", score >= 60))
@@ -173,7 +269,7 @@ the interview — they can replace or supplement Phase 2/3 questions):
 {formatted}
 """
 
-    system_prompt = f"""
+    prompt = f"""
 {_PERSONA}
 
 You are about to start a live spoken interview. All output MUST be written in {lang}.
@@ -200,13 +296,7 @@ Return STRICT JSON — no markdown, no extra keys:
 }}
 """.strip()
 
-    resp = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt}],
-        temperature=0.4,
-    )
-    return json.loads(resp.choices[0].message.content)
+    return await _generate_json(prompt, temperature=0.4)
 
 
 # ── 2. Adaptive next-question generation ──────────────────────────────────────
@@ -214,11 +304,11 @@ Return STRICT JSON — no markdown, no extra keys:
 # How many characters of the JD and resume to embed on each mid-interview turn.
 # The first question already used the full documents. For follow-up questions
 # only the key bullet points matter — 600 / 800 chars covers that easily and
-# cuts input tokens by ~60-70 %, saving 3-6 s per GPT call.
+# cuts input tokens significantly, saving time per model call.
 _JD_SNIPPET_CHARS     = 600
 _RESUME_SNIPPET_CHARS = 800
 
-# Cap the conversation history sent to GPT at the last N turns.
+# Cap the conversation history sent to the model at the last N turns.
 # Beyond 6 turns the model rarely changes its line of questioning based on
 # older turns, and shorter context = faster time-to-first-token.
 _MAX_HISTORY_TURNS = 6
@@ -278,7 +368,7 @@ IMPORTANT — Pending recruiter custom questions (ask these if they fit the curr
 {formatted}
 """
 
-    system_prompt = f"""
+    prompt = f"""
 {_PERSONA}
 
 All output MUST be written in {lang}.
@@ -310,36 +400,146 @@ Return STRICT JSON — no markdown:
 {{"question": "string"}}
 """.strip()
 
-    resp = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt}],
-        temperature=0.45,   # was 0.5 — slightly tighter to reduce output length variance
-    )
-    data = json.loads(resp.choices[0].message.content)
+    data = await _generate_json(prompt, temperature=0.45)
     return data.get("question", "").strip()
 
 
-# ── 3. Whisper transcription (language-aware) ─────────────────────────────────
+# ── 3. Speech-to-text (Gemini audio understanding) ────────────────────────────
 
 async def transcribe_audio(
     audio_bytes: bytes,
     filename:    str = "audio.webm",
     language:    str = "en",
 ) -> str:
-    audio_file      = io.BytesIO(audio_bytes)
-    audio_file.name = filename
+    """
+    Transcribe spoken audio with Gemini.
 
-    transcription = await client.audio.transcriptions.create(
-        model           = "whisper-1",
-        file            = audio_file,
-        language        = language if language != "auto" else None,
-        response_format = "text",
+    Below the 20 MB inline limit the audio is passed as inline bytes (fast, no
+    extra round-trip). Larger payloads are uploaded via the Files API first.
+    Interview answers are short, so the inline path is the norm.
+    """
+    if not audio_bytes:
+        return ""
+
+    mime_type = _guess_audio_mime(filename)
+
+    if language and language.lower() != "auto":
+        lang_clause = f"The expected language is {_lang_name(language)}."
+    else:
+        lang_clause = "Detect the spoken language automatically."
+
+    instruction = (
+        "Transcribe the speech in this audio clip verbatim. "
+        f"{lang_clause} "
+        "Output ONLY the transcript text — no preamble, no speaker labels, no "
+        "quotation marks, no commentary. If there is no intelligible speech, "
+        "output nothing."
     )
-    return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+
+    if len(audio_bytes) < _INLINE_AUDIO_LIMIT:
+        contents = [
+            instruction,
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ]
+        resp = await client.aio.models.generate_content(
+            model=STT_MODEL,
+            contents=contents,
+        )
+    else:
+        # ── Large file: upload via the Files API, then reference it ───────────
+        suffix   = os.path.splitext(filename)[1] or ".webm"
+        tmp_path = None
+        uploaded = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            uploaded = await client.aio.files.upload(
+                file=tmp_path,
+                config=types.UploadFileConfig(mime_type=mime_type),
+            )
+            resp = await client.aio.models.generate_content(
+                model=STT_MODEL,
+                contents=[instruction, uploaded],
+            )
+        finally:
+            if uploaded is not None:
+                try:
+                    await client.aio.files.delete(name=uploaded.name)
+                except Exception:  # cleanup is best-effort
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    transcript = (resp.text or "").strip()
+    # Defensively strip wrapping quotes the model occasionally adds.
+    if len(transcript) >= 2 and transcript[0] in "\"'" and transcript[-1] == transcript[0]:
+        transcript = transcript[1:-1].strip()
+    return transcript
 
 
-# ── 4. Enhanced report generation ─────────────────────────────────────────────
+def _guess_audio_mime(filename: str) -> str:
+    name = (filename or "").lower()
+    if   name.endswith(".webm"): return "audio/webm"
+    elif name.endswith(".ogg"):  return "audio/ogg"
+    elif name.endswith(".mp4") or name.endswith(".m4a"): return "audio/mp4"
+    elif name.endswith(".mp3"):  return "audio/mp3"
+    elif name.endswith(".wav"):  return "audio/wav"
+    elif name.endswith(".flac"): return "audio/flac"
+    return "audio/webm"
+
+
+# ── 4. Text-to-speech (Gemini TTS) ────────────────────────────────────────────
+
+async def synthesize_speech(
+    text:     str,
+    language: str           = "en",
+    voice:    Optional[str] = None,
+    style:    Optional[str] = None,
+) -> bytes:
+    """
+    Convert text to natural speech and return WAV-encoded bytes (24 kHz mono).
+
+    `voice` defaults to GEMINI_TTS_VOICE. `style` is an optional spoken-delivery
+    directive (e.g. "Say warmly and clearly:") — the model follows it rather than
+    reading it aloud. We leave it off by default so nothing unintended is spoken.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("synthesize_speech: empty text")
+
+    spoken = f"{style.strip()} {text}" if style else text
+
+    voice_name    = voice or TTS_VOICE
+    speech_config = types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+        ),
+    )
+    bcp47 = _LANGUAGE_BCP47.get((language or "en").lower())
+    if bcp47:
+        speech_config.language_code = bcp47
+
+    resp = await client.aio.models.generate_content(
+        model=TTS_MODEL,
+        contents=spoken,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=speech_config,
+        ),
+    )
+
+    part = resp.candidates[0].content.parts[0]
+    pcm  = part.inline_data.data
+    if isinstance(pcm, str):          # defensive: decode if base64-encoded
+        pcm = base64.b64decode(pcm)
+    if not pcm:
+        raise RuntimeError("Gemini TTS returned no audio data.")
+
+    return _pcm_to_wav(pcm)
+
+
+# ── 5. Enhanced report generation ─────────────────────────────────────────────
 
 async def generate_report(
     answers:          list,
@@ -373,7 +573,20 @@ async def generate_report(
   Key phrases        : {nlp_metrics.get('key_phrases', [])}
 """
 
-    system_prompt = f"""
+    # Filler-word and sentiment metrics are English-only. For other languages
+    # they were not computed (the numbers above are placeholders), so tell the
+    # model to ignore them and assess communication qualitatively instead.
+    metrics_supported = (language or "en").lower() == "en"
+    metrics_note = "" if metrics_supported else (
+        f"\nIMPORTANT — Automated filler-word and sentiment metrics are English-only "
+        f"and were NOT computed for this {lang} interview. Ignore the zeroed filler/"
+        f"sentiment/confidence numbers above; they are placeholders. Assess "
+        f"communication and soft skills qualitatively from the transcript instead. "
+        f"In the output set filler_word_usage to \"n/a\", top_fillers to [], and base "
+        f"overall_sentiment and confidence on your qualitative read of the answers.\n"
+    )
+
+    prompt = f"""
 {_PERSONA}
 
 The interview has concluded. Produce a detailed evaluation report.
@@ -394,7 +607,7 @@ Report language: {lang} (write ALL text fields in {lang}).
   Sentiment distribution : {sentiment_counts}
   Avg sentiment score    : {avg_sentiment:.2f}
   Confidence distribution: {confidence_counts}
-{nlp_section}
+{nlp_section}{metrics_note}
 ─── Evaluation rubric ────────────────────────────────────────────────────────
   score: (correct answers / total questions) × 100
   communication_score: clarity, structure, examples, filler usage
@@ -426,10 +639,7 @@ Return STRICT JSON — no markdown, no extra keys:
 }}
 """.strip()
 
-    resp = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt}],
-        temperature=0.3,
-    )
-    return json.loads(resp.choices[0].message.content)
+    # No response_schema here: the report has nullable nested fields, which the
+    # Gemini structured-output schema validator rejects (no union/AnyOf support).
+    # The prompt fully specifies the shape, exactly as the OpenAI version did.
+    return await _generate_json(prompt, temperature=0.3)

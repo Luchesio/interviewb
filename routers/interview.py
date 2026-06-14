@@ -30,6 +30,7 @@ from fastapi import (
     APIRouter, File, Form, HTTPException, UploadFile,
     WebSocket, WebSocketDisconnect,
 )
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from models.interview import InteriewStatusEnum
@@ -38,6 +39,7 @@ from services.ai_service import (
     generate_next_question,
     generate_report,
     transcribe_audio,
+    synthesize_speech,
 )
 from services.interview_service import (
     create_session,
@@ -50,7 +52,7 @@ from services.interview_service import (
 )
 from services.soft_skill_analyzer import aggregate_nlp_metrics
 from util.file_util import extract_text, validate_file
-from db.mongo import reports_col, applications_col, jobs_col, users_col
+from db.mongo import reports_col, applications_col, jobs_col, users_col, tokens_col, sessions_col
 
 log    = logging.getLogger(__name__)
 router = APIRouter(prefix="/interview", tags=["Interview"])
@@ -103,20 +105,66 @@ async def generate_questions(
 
 @router.get("/start/{session_id}")
 async def start_interview(session_id: str):
+    """
+    Read-only interview state — safe to call on page load and on resume.
+
+    Deliberately does NOT start the timer or consume the token, so loading the
+    page (or refreshing during setup) never burns interview time or the link.
+    The timer/token are committed by POST /begin when the candidate actually
+    starts. Returns the current question and real remaining time so a candidate
+    who dropped mid-interview can resume from where they left off.
+    """
     session = await get_session(session_id)
-    if not session or session.status == InteriewStatusEnum.COMPLETED:
+    if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Start the server-side timer on first load
-    await start_timer(session)
+    idx        = session.current_index
+    questions  = session.questions
+    current_q  = questions[idx] if idx < len(questions) else (questions[-1] if questions else "")
+    in_progress = session.status != InteriewStatusEnum.COMPLETED
 
     return {
-        "introText":       session.introText,
-        "firstQuestion":   session.questions[0] if session.questions else "",
-        "candidateName":   session.candidate_name,
-        "durationMinutes": session.duration_minutes,
-        "language":        getattr(session, "language", "en"),
+        "status":           session.status.value,
+        "introText":        session.introText,
+        "firstQuestion":    questions[0] if questions else "",
+        "currentQuestion":  current_q,
+        "questionIndex":    idx + 1,
+        "resumed":          in_progress and idx > 0,
+        "candidateName":    session.candidate_name,
+        "durationMinutes":  session.duration_minutes,
+        "secondsRemaining": int(session.seconds_remaining()),
+        "language":         getattr(session, "language", "en"),
     }
+
+
+@router.post("/begin/{session_id}")
+async def begin_interview(session_id: str):
+    """
+    Commit the start of the interview: start the server-side timer (idempotent)
+    and consume the invite token (mark it used, application → started). Called
+    once when the candidate actually begins. Safe to call again on resume — the
+    timer won't reset and the token stays consumed.
+    """
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status == InteriewStatusEnum.COMPLETED:
+        return {"alreadyCompleted": True}
+
+    await start_timer(session)  # idempotent — only sets expires_at the first time
+
+    tok = await tokens_col().find_one_and_update(
+        {"session_id": session_id, "used": False},
+        {"$set": {"used": True}},
+    )
+    if tok:
+        await applications_col().update_one(
+            {"application_id": tok["application_id"]},
+            {"$set": {"status": "started"}},
+        )
+
+    session = await get_session(session_id)
+    return {"started": True, "secondsRemaining": int(session.seconds_remaining())}
 
 
 # ── 3. HTTP answer submission — main Q&A endpoint (replaces WebSocket) ────────
@@ -142,6 +190,7 @@ async def submit_answer(session_id: str, body: AnswerRequest):
         raise HTTPException(status_code=404, detail="Session not found")
 
     if session.status == InteriewStatusEnum.COMPLETED:
+        await _safe_ensure_report(session_id)
         return {"type": "completed"}
 
     # Defensive: start the server-side timer if it hasn't been started yet.
@@ -151,6 +200,7 @@ async def submit_answer(session_id: str, body: AnswerRequest):
 
     if session.is_time_up():
         await mark_completed(session)
+        await _safe_ensure_report(session_id)
         return {"type": "time_up"}
 
     # Save answer FIRST, then fetch the updated session so the AI sees the
@@ -161,6 +211,7 @@ async def submit_answer(session_id: str, body: AnswerRequest):
     if not session or session.is_time_up():
         if session:
             await mark_completed(session)
+        await _safe_ensure_report(session_id)
         return {"type": "time_up"}
 
     # Load custom questions from the job posting
@@ -188,6 +239,7 @@ async def submit_answer(session_id: str, body: AnswerRequest):
 
     if not next_question or session.is_time_up():
         await mark_completed(session)
+        await _safe_ensure_report(session_id)
         return {"type": "time_up"}
 
     await append_question(session, next_question)
@@ -327,7 +379,7 @@ async def _tick_loop(websocket: WebSocket, session_id: str) -> None:
         pass
 
 
-# ── 5. Whisper transcription ──────────────────────────────────────────────────
+# ── 5. Speech-to-text (Gemini) ────────────────────────────────────────────────
 
 @router.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
@@ -342,6 +394,43 @@ async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
     return {"transcript": transcript}
 
 
+# ── 5b. Text-to-speech (Gemini) ───────────────────────────────────────────────
+#
+#  Generates natural speech for an interview question and returns WAV audio
+#  (24 kHz mono). The frontend plays this instead of the browser's robotic
+#  Web Speech voices, and silently falls back to the browser voice if this
+#  endpoint errors — so a TTS hiccup never blocks the interview.
+
+class TTSRequest(BaseModel):
+    text:     str
+    language: str           = "en"
+    voice:    Optional[str] = None   # override the default GEMINI_TTS_VOICE
+
+
+@router.post("/tts")
+async def tts(body: TTSRequest):
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    try:
+        wav_bytes = await synthesize_speech(
+            text=text,
+            language=body.language or "en",
+            voice=body.voice,
+        )
+    except Exception as exc:
+        # Surface a clean 502 so the client can fall back to its browser voice.
+        log.warning("TTS synthesis failed: %s", exc)
+        raise HTTPException(status_code=502, detail="TTS synthesis failed")
+
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # ── 6. Force-end fallback ─────────────────────────────────────────────────────
 
 @router.put("/end/{session_id}")
@@ -350,108 +439,175 @@ async def end_interview(session_id: str):
     if not session or session.status == InteriewStatusEnum.COMPLETED:
         raise HTTPException(status_code=404, detail="Session not found")
     await mark_completed(session)
+    # Generate the report server-side now, so it exists even if the client never
+    # follows up with GET /report (e.g. the candidate closes the tab).
+    await _safe_ensure_report(session_id)
     return {"interviewEnded": True}
 
 
-# ── 7. Report — generate, persist, email recruiter ───────────────────────────
+# ── 7. Report — generate once, persist, email recruiter ──────────────────────
+
+_COMPLETION_MESSAGE = (
+    "Your interview is complete. Thank you for your time! "
+    "The results have been sent to the hiring team."
+)
+
+# Per-session in-process lock. Serializes concurrent report generation within a
+# warm instance — e.g. the inline call at time-up racing the client's GET — so
+# the report (and recruiter email) is produced exactly once. The DB existence
+# check inside the lock also guards across separate (cold) invocations.
+_report_locks: dict[str, asyncio.Lock] = {}
+
+
+def _report_lock(session_id: str) -> asyncio.Lock:
+    lock = _report_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _report_locks[session_id] = lock
+    return lock
+
+
+async def ensure_report(session_id: str) -> dict:
+    """
+    Idempotently generate, store and email the interview report.
+
+    Returns { report_id, message }. If a report already exists for the session
+    it is returned without regenerating (no duplicate LLM call, no duplicate
+    email). This is called both inline when the interview completes (so the
+    report survives the candidate closing their tab) and from GET /report.
+    """
+    async with _report_lock(session_id):
+        existing = await reports_col().find_one(
+            {"session_id": session_id}, {"report_id": 1, "report": 1}
+        )
+        if existing and existing.get("report"):
+            return {"report_id": existing["report_id"], "message": _COMPLETION_MESSAGE}
+
+        session = await get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Make sure the session is marked complete so the report is final.
+        if session.status != InteriewStatusEnum.COMPLETED:
+            await mark_completed(session)
+            session = await get_session(session_id)
+
+        answers_payload = [a.model_dump() for a in session.answers]
+        language        = getattr(session, "language", "en")
+
+        nlp_metrics = aggregate_nlp_metrics(answers_payload, language)
+
+        result = await generate_report(
+            answers_payload,
+            session.duration_minutes,
+            language    = language,
+            nlp_metrics = nlp_metrics,
+        )
+
+        app_doc = await applications_col().find_one({"session_id": session_id})
+
+        report_id     = str(uuid.uuid4())
+        stored_report = {
+            "report_id":       report_id,
+            "session_id":      session_id,
+            "application_id":  app_doc["application_id"]  if app_doc else None,
+            "job_id":          app_doc["job_id"]           if app_doc else getattr(session, "job_id", None),
+            "candidate_name":  app_doc["candidate_name"]   if app_doc else session.candidate_name,
+            "candidate_email": app_doc["candidate_email"]  if app_doc else "",
+            "job_title":       session.job_title,
+            "report":          result,
+            "answers":         answers_payload,
+            "language":        language,
+            "created_at":      datetime.utcnow(),
+        }
+
+        await reports_col().replace_one(
+            {"session_id": session_id},
+            stored_report,
+            upsert=True,
+        )
+
+        if app_doc:
+            await applications_col().update_one(
+                {"application_id": app_doc["application_id"]},
+                {"$set": {"status": "completed"}},
+            )
+
+            job_doc = await jobs_col().find_one({"job_id": app_doc["job_id"]})
+            if job_doc:
+                recruiter_id = job_doc.get("recruiter_id", "")
+                recruiter    = await users_col().find_one({"user_id": recruiter_id})
+
+                if recruiter and recruiter.get("email"):
+                    from services.email_service import send_report_to_recruiter
+                    ok = await send_report_to_recruiter(
+                        to_email       = recruiter["email"],
+                        recruiter_name = recruiter.get("name") or recruiter.get("email", "Recruiter"),
+                        candidate_name = app_doc["candidate_name"],
+                        job_title      = session.job_title,
+                        report         = result,
+                        report_id      = report_id,
+                        job_id         = app_doc["job_id"],
+                    )
+                    if ok:
+                        log.info("Report email sent → recruiter %s | report_id=%s", recruiter["email"], report_id)
+                    else:
+                        log.warning("Report email failed → recruiter %s | report_id=%s", recruiter["email"], report_id)
+                else:
+                    log.warning("Recruiter %s has no email on record — report not emailed.", recruiter_id)
+
+                from routers.recruiter import notify_new_report
+                await notify_new_report(
+                    job_id         = app_doc["job_id"],
+                    candidate_name = app_doc["candidate_name"],
+                    job_title      = session.job_title,
+                    recruiter_id   = recruiter_id,
+                )
+
+        log.info("Report saved: report_id=%s session=%s", report_id, session_id)
+        return {"report_id": report_id, "message": _COMPLETION_MESSAGE}
+
+
+async def _safe_ensure_report(session_id: str) -> None:
+    """Best-effort inline report generation — never blocks completing a turn."""
+    try:
+        await ensure_report(session_id)
+    except Exception as exc:
+        # The client's GET /report (and the cron sweep) remain as fallbacks.
+        log.warning("Inline report generation failed for %s: %s", session_id, exc)
+
 
 @router.get("/report/{session_id}")
 async def report(session_id: str):
-    """
-    Generate the AI report with NLP, persist it, then:
-      - Email the full report to the recruiter who owns the job.
-      - Send a Slack notification (if configured).
-      - Return only { report_id, message } to the frontend.
-    """
-    session = await get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    """Return the report, generating it on first call (idempotent thereafter)."""
+    return await ensure_report(session_id)
 
-    answers_payload = [a.model_dump() for a in session.answers]
-    language        = getattr(session, "language", "en")
 
-    nlp_metrics = aggregate_nlp_metrics(answers_payload)
+# ── 8. Sweep — finalize interviews abandoned after time-up (cron target) ──────
+#
+#  On serverless there's no in-process scheduler, so a candidate who abandons
+#  mid-question (never sends another request) won't get finalized on their own.
+#  Point a scheduled trigger (e.g. Vercel Cron) at this endpoint to generate the
+#  reports for any timed-out, still-in-progress sessions.
 
-    result = await generate_report(
-        answers_payload,
-        session.duration_minutes,
-        language    = language,
-        nlp_metrics = nlp_metrics,
+@router.post("/sweep-expired")
+async def sweep_expired():
+    now       = time.time()
+    finalized = []
+    cursor = sessions_col().find(
+        {
+            "status":     InteriewStatusEnum.IN_PROGRESS.value,
+            "expires_at": {"$gt": 0, "$lte": now},
+        },
+        {"session_id": 1},
     )
-
-    app_doc = await applications_col().find_one({"session_id": session_id})
-
-    report_id     = str(uuid.uuid4())
-    stored_report = {
-        "report_id":       report_id,
-        "session_id":      session_id,
-        "application_id":  app_doc["application_id"]  if app_doc else None,
-        "job_id":          app_doc["job_id"]           if app_doc else getattr(session, "job_id", None),
-        "candidate_name":  app_doc["candidate_name"]   if app_doc else session.candidate_name,
-        "candidate_email": app_doc["candidate_email"]  if app_doc else "",
-        "job_title":       session.job_title,
-        "report":          result,
-        "answers":         answers_payload,
-        "language":        language,
-        "created_at":      datetime.utcnow(),
-    }
-
-    await reports_col().replace_one(
-        {"session_id": session_id},
-        stored_report,
-        upsert=True,
-    )
-
-    if app_doc:
-        await applications_col().update_one(
-            {"application_id": app_doc["application_id"]},
-            {"$set": {"status": "completed"}},
-        )
-
-    if app_doc:
-        job_doc = await jobs_col().find_one({"job_id": app_doc["job_id"]})
-        if job_doc:
-            recruiter_id = job_doc.get("recruiter_id", "")
-            recruiter    = await users_col().find_one({"user_id": recruiter_id})
-
-            if recruiter and recruiter.get("email"):
-                from services.email_service import send_report_to_recruiter
-                ok = await send_report_to_recruiter(
-                    to_email       = recruiter["email"],
-                    recruiter_name = recruiter.get("name") or recruiter.get("email", "Recruiter"),
-                    candidate_name = app_doc["candidate_name"],
-                    job_title      = session.job_title,
-                    report         = result,
-                    report_id      = report_id,
-                    job_id         = app_doc["job_id"],
-                )
-                if ok:
-                    log.info(
-                        "Report email sent → recruiter %s | report_id=%s",
-                        recruiter["email"], report_id,
-                    )
-                else:
-                    log.warning(
-                        "Report email failed → recruiter %s | report_id=%s",
-                        recruiter["email"], report_id,
-                    )
-            else:
-                log.warning(
-                    "Recruiter %s has no email address on record — report not emailed.",
-                    recruiter_id,
-                )
-
-            from routers.recruiter import notify_new_report
-            await notify_new_report(
-                job_id         = app_doc["job_id"],
-                candidate_name = app_doc["candidate_name"],
-                job_title      = session.job_title,
-                recruiter_id   = recruiter_id,
-            )
-
-    log.info("Report saved: report_id=%s session=%s", report_id, session_id)
-
-    return {
-        "report_id": report_id,
-        "message":   "Your interview is complete. Thank you for your time! The results have been sent to the hiring team.",
-    }
+    async for doc in cursor:
+        sid = doc.get("session_id")
+        if not sid:
+            continue
+        try:
+            await ensure_report(sid)
+            finalized.append(sid)
+        except Exception as exc:
+            log.warning("Sweep: failed to finalize %s: %s", sid, exc)
+    return {"finalized": len(finalized)}

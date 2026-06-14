@@ -9,7 +9,7 @@ python-jose[cryptography]  # JWT encode/decode
 passlib[bcrypt]             # password hashing
 
 # AI / NLP
-openai
+google-genai        # Gemini: text, STT (audio understanding) + TTS
 python-dotenv
 
 # Soft skill analysis

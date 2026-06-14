@@ -50,9 +50,12 @@ class InterviewToken(BaseModel):
     token:          str
     application_id: str
     job_id:         str
-    session_id:     str
-    expires_at:     datetime
-    used:           bool = False
+    # session_id is created lazily when the candidate first opens the link, so
+    # the heavy intro/question generation is deferred out of the /apply request.
+    session_id:       Optional[str] = None
+    duration_minutes: int           = 15
+    expires_at:       datetime
+    used:             bool = False
 
 
 # ── Report (stored after interview completes) ─────────────────────────────────

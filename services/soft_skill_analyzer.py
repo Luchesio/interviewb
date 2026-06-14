@@ -30,6 +30,16 @@ FILLER_WORDS: set[str] = {
 _MULTI_WORD_FILLERS  = {f for f in FILLER_WORDS if " " in f}
 _SINGLE_WORD_FILLERS = {f for f in FILLER_WORDS if " " not in f}
 
+# The filler corpus, TextBlob sentiment, and confidence heuristics below are all
+# English-specific. Running them on other languages produces meaningless filler
+# counts and sentiment, which then pollute the report. We only compute these
+# metrics for the languages they're actually valid for.
+_METRICS_SUPPORTED_LANGS = {"en"}
+
+
+def metrics_supported(language: str) -> bool:
+    return (language or "en").lower() in _METRICS_SUPPORTED_LANGS
+
 # ── NLP label → soft-skill mapping ────────────────────────────────────────────
 # Maps zero-shot candidate labels to soft-skill dimensions
 _LEADERSHIP_PHRASES = [
@@ -193,11 +203,15 @@ def analyse_nlp_soft_skills(text: str) -> Optional[dict]:
     }
 
 
-def analyse_answer(text: str | None) -> dict:
+def analyse_answer(text: str | None, language: str = "en") -> dict:
     """
     Convenience wrapper used by interview_service.
     Returns a dict ready to merge into an Answer model.
     Tier 2 NLP results are stored separately and merged into report at generation time.
+
+    The metrics are English-only. For other languages we store neutral
+    placeholders instead of misleading English-derived numbers; the report
+    generator is told these weren't computed (see generate_report).
     """
     if not text:
         return {
@@ -206,6 +220,15 @@ def analyse_answer(text: str | None) -> dict:
             "sentiment":          "neutral",
             "sentiment_score":    0.0,
             "confidence_level":   "low",
+        }
+
+    if not metrics_supported(language):
+        return {
+            "filler_word_count":  0,
+            "filler_words_found": [],
+            "sentiment":          "neutral",
+            "sentiment_score":    0.0,
+            "confidence_level":   "medium",
         }
 
     filler_count, filler_list     = detect_filler_words(text)
@@ -221,11 +244,15 @@ def analyse_answer(text: str | None) -> dict:
     }
 
 
-def aggregate_nlp_metrics(answers: list[dict]) -> Optional[dict]:
+def aggregate_nlp_metrics(answers: list[dict], language: str = "en") -> Optional[dict]:
     """
     Run NLP analysis across all answers and return aggregated metrics.
-    Called once at report generation time.
+    Called once at report generation time. English-only — returns None for
+    other languages so the report doesn't present invalid soft-skill scores.
     """
+    if not metrics_supported(language):
+        return None
+
     all_text = " ".join(
         a.get("answer", "") or ""
         for a in answers

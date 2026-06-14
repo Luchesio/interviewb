@@ -20,8 +20,10 @@ from pydantic import BaseModel
 
 from db.mongo import applications_col, tokens_col, jobs_col, reports_col, media_col
 from models.job import Application, ApplicationStatus, InterviewToken
+from models.interview import InteriewStatusEnum
 from services.ai_service import generate_questions_intro, screen_resume
-from services.interview_service import create_session
+from services.interview_service import create_session, get_session
+from store.session_store import delete_session
 from services.email_service import send_candidate_fit_email
 from util.file_util import extract_text, validate_file
 
@@ -131,33 +133,16 @@ async def apply(
             "screening":      {"is_fit": False, "score": score},
         }
 
-    ai_resp = await generate_questions_intro(
-        job_title        = job["job_title"],
-        job_description  = job["job_description"],
-        resume_text      = resume_text,
-        candidate_name   = candidate_name,
-        language         = language,
-        custom_questions = job.get("custom_questions", []),
-    )
-
-    session = await create_session(
-        job_title        = job["job_title"],
-        job_description  = job["job_description"],
-        resume_text      = resume_text,
-        candidate_name   = ai_resp.get("candidate_name", candidate_name),
-        intro_text       = ai_resp.get("introText", ""),
-        first_question   = ai_resp.get("first_question", ""),
-        duration_minutes = duration_minutes,
-        language         = language,
-    )
-
+    # The interview session + questions are created lazily on first link-open
+    # (see verify_token), not here — this keeps the /apply response fast and
+    # avoids a second blocking LLM call in the request path.
     application = Application(
         application_id  = str(uuid.uuid4()),
         job_id          = job_id,
         candidate_name  = candidate_name,
         candidate_email = candidate_email,
         resume_text     = resume_text,
-        session_id      = session.session_id,
+        session_id      = None,
         status          = ApplicationStatus.INVITED,
         language        = language,
     )
@@ -169,11 +154,12 @@ async def apply(
     expires_at = datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)
 
     interview_token = InterviewToken(
-        token          = raw_token,
-        application_id = application.application_id,
-        job_id         = job_id,
-        session_id     = session.session_id,
-        expires_at     = expires_at,
+        token            = raw_token,
+        application_id   = application.application_id,
+        job_id           = job_id,
+        session_id       = None,                 # created on first open
+        duration_minutes = duration_minutes,
+        expires_at       = expires_at,
     )
     await tokens_col().insert_one(interview_token.model_dump())
 
@@ -197,38 +183,88 @@ async def apply(
     }
 
 
-# ── 2. Verify token & load session ───────────────────────────────────────────
+# ── 2. Verify token & load (or lazily create) session ────────────────────────
 
 @router.get("/interview/verify")
 async def verify_token(token: str):
+    """
+    Validate an interview link and return its session.
+
+    The token is NOT consumed here — it is consumed when the interview actually
+    starts (POST /interview/begin). That means a refresh or a dropped connection
+    on the loading screen no longer locks the candidate out, and a candidate who
+    started but disconnected can re-open the same link to resume, as long as the
+    interview isn't already completed and the link hasn't expired.
+
+    On the first open the interview session (intro + first question) is generated
+    here, lazily — this work was deferred from /apply to keep that endpoint fast.
+    """
     now = datetime.now(timezone.utc)
 
     token_doc = await tokens_col().find_one({"token": token})
     if not token_doc:
-        raise HTTPException(status_code=404, detail="Invalid or expired interview link")
-
-    if token_doc.get("used"):
-        raise HTTPException(status_code=410, detail="This interview link has already been used")
+        raise HTTPException(status_code=404, detail="Invalid interview link")
 
     expires_at = token_doc["expires_at"]
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-
     if now > expires_at:
         raise HTTPException(status_code=410, detail="This interview link has expired")
 
-    await tokens_col().update_one({"token": token}, {"$set": {"used": True}})
+    session_id = token_doc.get("session_id")
+    session    = await get_session(session_id) if session_id else None
 
-    app_id = token_doc["application_id"]
-    await applications_col().update_one(
-        {"application_id": app_id},
-        {"$set": {"status": ApplicationStatus.STARTED.value}},
-    )
+    # Already finished → the link is spent.
+    if session and session.status == InteriewStatusEnum.COMPLETED:
+        raise HTTPException(status_code=410, detail="This interview has already been completed")
 
-    session_id = token_doc["session_id"]
+    # First open → generate the session now (deferred from /apply).
+    if not session:
+        app_doc = await applications_col().find_one(
+            {"application_id": token_doc["application_id"]}
+        )
+        job_doc = await jobs_col().find_one({"job_id": token_doc["job_id"]})
+        if not app_doc or not job_doc:
+            raise HTTPException(status_code=404, detail="Interview details not found")
 
-    from services.interview_service import get_session
-    session = await get_session(session_id)
+        ai_resp = await generate_questions_intro(
+            job_title        = job_doc["job_title"],
+            job_description  = job_doc["job_description"],
+            resume_text      = app_doc.get("resume_text", ""),
+            candidate_name   = app_doc.get("candidate_name"),
+            language         = app_doc.get("language", "en"),
+            custom_questions = job_doc.get("custom_questions", []),
+        )
+
+        session = await create_session(
+            job_title        = job_doc["job_title"],
+            job_description  = job_doc["job_description"],
+            resume_text      = app_doc.get("resume_text", ""),
+            candidate_name   = ai_resp.get("candidate_name", app_doc.get("candidate_name", "Candidate")),
+            intro_text       = ai_resp.get("introText", ""),
+            first_question   = ai_resp.get("first_question", ""),
+            duration_minutes = token_doc.get("duration_minutes", 15),
+            language         = app_doc.get("language", "en"),
+        )
+
+        # Link it to the token only if no one else got there first (double-open
+        # guard). If a concurrent open already created one, discard ours.
+        res = await tokens_col().update_one(
+            {"token": token, "session_id": None},
+            {"$set": {"session_id": session.session_id}},
+        )
+        if res.modified_count == 0:
+            fresh      = await tokens_col().find_one({"token": token})
+            other_sid  = (fresh or {}).get("session_id")
+            if other_sid and other_sid != session.session_id:
+                await delete_session(session.session_id)
+                session = await get_session(other_sid)
+        else:
+            await applications_col().update_one(
+                {"application_id": token_doc["application_id"]},
+                {"$set": {"session_id": session.session_id}},
+            )
+
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
 
@@ -238,7 +274,7 @@ async def verify_token(token: str):
         "firstQuestion":   session.questions[0] if session.questions else "",
         "candidateName":   session.candidate_name,
         "durationMinutes": session.duration_minutes,
-        "application_id":  app_id,
+        "application_id":  token_doc["application_id"],
         "language":        getattr(session, "language", "en"),
     }
 
