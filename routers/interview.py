@@ -21,7 +21,6 @@ Other notes:
 """
 
 import asyncio
-import base64
 import logging
 import os
 import time
@@ -247,25 +246,15 @@ async def submit_answer(session_id: str, body: AnswerRequest):
 
     await append_question(session, next_question)
 
-    # Synthesize the question audio here and return it inline, so the client can
-    # play it the moment the response arrives — saving a separate /tts round-trip
-    # (the single biggest source of the gap before the next question is spoken).
-    # Best-effort: if TTS fails the client still gets the text and falls back to
-    # its own /tts call or the browser voice.
-    audio_b64 = None
-    try:
-        wav = await synthesize_speech(next_question, language=getattr(session, "language", "en"))
-        audio_b64 = base64.b64encode(wav).decode("ascii")
-    except Exception as exc:
-        log.warning("Inline TTS for next question failed (client will fall back): %s", exc)
-
+    # Return the question text immediately so the candidate sees the next
+    # question with the least possible delay. The audio is fetched separately by
+    # the client (/tts) and played when ready — blocking this response on speech
+    # synthesis would make the visible question appear several seconds later.
     return {
         "type":              "question",
         "text":              next_question,
         "index":             next_q_number,
         "seconds_remaining": int(session.seconds_remaining()),
-        "audio_base64":      audio_b64,
-        "audio_mime":        "audio/wav",
     }
 
 

@@ -136,17 +136,30 @@ async def get_full_report(report_id: str, current: CurrentRecruiter):
     if not doc:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    # Recording URLs are stored separately in media_col (one per webcam/screen),
-    # keyed by session_id — attach them so the recruiter can play them back.
+    # Recording URLs are stored separately in media_col as ordered segments
+    # (progressive upload), keyed by session_id — attach them in order so the
+    # recruiter can play them back-to-back.
     session_id = doc.get("session_id")
     if session_id:
-        async for m in media_col().find(
-            {"session_id": session_id}, {"_id": 0, "media_type": 1, "url": 1}
-        ):
+        webcam_segs: list[str] = []
+        screen_segs: list[str] = []
+        cursor = media_col().find(
+            {"session_id": session_id},
+            {"_id": 0, "media_type": 1, "url": 1, "segment_index": 1},
+        ).sort("segment_index", 1)
+        async for m in cursor:
+            if not m.get("url"):
+                continue
             if m.get("media_type") == "screen":
-                doc["screen_url"] = m.get("url")
+                screen_segs.append(m["url"])
             else:
-                doc["webcam_url"] = m.get("url")
+                webcam_segs.append(m["url"])
+        if webcam_segs:
+            doc["webcam_urls"] = webcam_segs
+            doc["webcam_url"]  = webcam_segs[0]   # backward-compatible single URL
+        if screen_segs:
+            doc["screen_urls"] = screen_segs
+            doc["screen_url"]  = screen_segs[0]
 
     return doc
 

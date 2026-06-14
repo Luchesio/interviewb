@@ -352,21 +352,25 @@ class SaveMediaUrl(BaseModel):
     media_type:     str = "webcam"
     cloudinary_url: str
     size_bytes:     Optional[int] = None
+    segment_index:  int = 0
 
 
 async def _persist_media_url(session_id: str, media_type: str,
-                             url: str, size_bytes: Optional[int]) -> str:
-    """Upsert one recording URL per (session, media_type) so re-uploads overwrite."""
+                             url: str, size_bytes: Optional[int],
+                             segment_index: int = 0) -> str:
+    """Upsert one recording URL per (session, media_type, segment) so re-uploads
+    overwrite and progressive segments are all retained in order."""
     media_id = str(uuid.uuid4())
     await media_col().update_one(
-        {"session_id": session_id, "media_type": media_type},
+        {"session_id": session_id, "media_type": media_type, "segment_index": segment_index},
         {"$set": {
-            "media_id":   media_id,
-            "session_id": session_id,
-            "media_type": media_type,
-            "url":        url,
-            "size_bytes": size_bytes,
-            "created_at": datetime.now(timezone.utc),
+            "media_id":      media_id,
+            "session_id":    session_id,
+            "media_type":    media_type,
+            "segment_index": segment_index,
+            "url":           url,
+            "size_bytes":    size_bytes,
+            "created_at":    datetime.now(timezone.utc),
         }},
         upsert=True,
     )
@@ -376,14 +380,16 @@ async def _persist_media_url(session_id: str, media_type: str,
 @router.post("/interview/save-media-url")
 async def save_media_url(payload: SaveMediaUrl):
     """Called by the browser after a direct-to-Cloudinary upload to persist the
-    resulting secure URL so the recruiter can play the recording back."""
+    resulting secure URL so the recruiter can play the recording back. Recordings
+    are uploaded progressively in segments during the interview."""
     if not payload.cloudinary_url:
         raise HTTPException(status_code=400, detail="cloudinary_url is required")
     media_id = await _persist_media_url(
         payload.session_id, payload.media_type,
-        payload.cloudinary_url, payload.size_bytes,
+        payload.cloudinary_url, payload.size_bytes, payload.segment_index,
     )
-    log.info("Media URL saved: session=%s type=%s", payload.session_id, payload.media_type)
+    log.info("Media URL saved: session=%s type=%s seg=%s",
+             payload.session_id, payload.media_type, payload.segment_index)
     return {"media_id": media_id, "saved": True}
 
 
