@@ -22,7 +22,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, HttpUrl
 
-from db.mongo import jobs_col, reports_col, users_col, applications_col, media_col
+from db.mongo import jobs_col, reports_col, users_col, applications_col, media_col, tokens_col, sessions_col
 from models.job import Job
 from dependencies.auth import get_current_recruiter, CurrentRecruiter
 from services.email_service import send_weekly_digest_to_recruiter
@@ -65,14 +65,31 @@ async def create_job(
 
 @router.get("/jobs")
 async def list_jobs(current: CurrentRecruiter):
-    """Return all active jobs for the authenticated recruiter."""
+    """Return all of the recruiter's jobs (active and paused), active first."""
     cursor = jobs_col().find(
-        {"recruiter_id": current["user_id"], "is_active": True},
+        {"recruiter_id": current["user_id"]},
         {"_id": 0},
-        sort=[("created_at", -1)],
+        sort=[("is_active", -1), ("created_at", -1)],
     )
     jobs = await cursor.to_list(length=200)
     return {"jobs": jobs}
+
+
+class JobStatus(BaseModel):
+    is_active: bool
+
+
+@router.patch("/jobs/{job_id}/status")
+async def set_job_status(job_id: str, body: JobStatus, current: CurrentRecruiter):
+    """Pause (stop accepting new applicants) or reopen a job posting. Existing
+    candidates and reports are untouched."""
+    result = await jobs_col().update_one(
+        {"job_id": job_id, "recruiter_id": current["user_id"]},
+        {"$set": {"is_active": body.is_active}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"is_active": body.is_active}
 
 
 @router.get("/jobs/{job_id}")
@@ -83,15 +100,140 @@ async def get_job(job_id: str, current: CurrentRecruiter):
     return doc
 
 
+async def _purge_job(job_id: str) -> None:
+    """Permanently remove a job posting and everything tied to it."""
+    session_ids: list[str] = []
+    async for app in applications_col().find({"job_id": job_id}, {"_id": 0, "session_id": 1}):
+        sid = app.get("session_id")
+        if sid:
+            session_ids.append(sid)
+
+    if session_ids:
+        await media_col().delete_many({"session_id": {"$in": session_ids}})
+        await sessions_col().delete_many({"session_id": {"$in": session_ids}})
+
+    await reports_col().delete_many({"job_id": job_id})
+    await tokens_col().delete_many({"job_id": job_id})
+    await applications_col().delete_many({"job_id": job_id})
+    await jobs_col().delete_one({"job_id": job_id})
+
+
 @router.delete("/jobs/{job_id}")
-async def deactivate_job(job_id: str, current: CurrentRecruiter):
-    result = await jobs_col().update_one(
-        {"job_id": job_id, "recruiter_id": current["user_id"]},
-        {"$set": {"is_active": False}},
-    )
-    if result.matched_count == 0:
+async def delete_job(job_id: str, current: CurrentRecruiter):
+    """Permanently delete a job posting and all of its candidates, reports and
+    recordings. The recruiter must own the posting."""
+    job = await jobs_col().find_one({"job_id": job_id}, {"_id": 0, "recruiter_id": 1})
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"message": "Job deactivated"}
+    if job.get("recruiter_id") != current["user_id"]:
+        raise HTTPException(status_code=403, detail="This job posting isn't yours")
+    await _purge_job(job_id)
+    return {"deleted": True}
+
+
+@router.delete("/account")
+async def delete_account(current: CurrentRecruiter):
+    """Permanently delete the recruiter's account and every job posting,
+    candidate, report and recording associated with it."""
+    recruiter_id = current["user_id"]
+    job_ids = await jobs_col().distinct("job_id", {"recruiter_id": recruiter_id})
+    for job_id in job_ids:
+        await _purge_job(job_id)
+    await users_col().delete_one({"user_id": recruiter_id})
+    log.info("Recruiter account deleted: %s (%d jobs purged)", recruiter_id, len(job_ids))
+    return {"deleted": True}
+
+
+@router.get("/overview")
+async def overview(current: CurrentRecruiter):
+    """At-a-glance totals across all of the recruiter's job postings."""
+    recruiter_id = current["user_id"]
+    job_ids = await jobs_col().distinct("job_id", {"recruiter_id": recruiter_id})
+
+    active_jobs = await jobs_col().count_documents(
+        {"recruiter_id": recruiter_id, "is_active": True}
+    )
+
+    candidates = interviewed = recommended = 0
+    if job_ids:
+        candidates  = await applications_col().count_documents({"job_id": {"$in": job_ids}})
+        interviewed = await reports_col().count_documents({"job_id": {"$in": job_ids}})
+        recommended = await reports_col().count_documents({
+            "job_id": {"$in": job_ids},
+            "report.hiring_recommendation": {"$in": ["strong_yes", "yes"]},
+        })
+
+    return {
+        "active_jobs":  active_jobs,
+        "candidates":   candidates,
+        "interviewed":  interviewed,
+        "recommended":  recommended,
+    }
+
+
+# ── Profile / account settings ────────────────────────────────────────────────
+
+@router.get("/profile")
+async def get_profile(current: CurrentRecruiter):
+    user = await users_col().find_one(
+        {"user_id": current["user_id"]},
+        {"_id": 0, "name": 1, "email": 1, "weekly_digest_enabled": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {
+        "name":  user.get("name", ""),
+        "email": user.get("email", ""),
+        "weekly_digest_enabled": user.get("weekly_digest_enabled", True),
+    }
+
+
+class ProfileUpdate(BaseModel):
+    name: str
+
+
+@router.patch("/profile")
+async def update_profile(body: ProfileUpdate, current: CurrentRecruiter):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name can't be empty")
+    await users_col().update_one(
+        {"user_id": current["user_id"]}, {"$set": {"name": name}}
+    )
+    return {"name": name}
+
+
+class PreferencesUpdate(BaseModel):
+    weekly_digest_enabled: bool
+
+
+@router.patch("/preferences")
+async def update_preferences(body: PreferencesUpdate, current: CurrentRecruiter):
+    await users_col().update_one(
+        {"user_id": current["user_id"]},
+        {"$set": {"weekly_digest_enabled": body.weekly_digest_enabled}},
+    )
+    return {"weekly_digest_enabled": body.weekly_digest_enabled}
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password:     str
+
+
+@router.post("/change-password")
+async def change_password(body: PasswordChange, current: CurrentRecruiter):
+    from routers.auth_router import hash_password, verify_password
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    user = await users_col().find_one({"user_id": current["user_id"]})
+    if not user or not verify_password(body.current_password, user.get("hashed_password", "")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    await users_col().update_one(
+        {"user_id": current["user_id"]},
+        {"$set": {"hashed_password": hash_password(body.new_password)}},
+    )
+    return {"changed": True}
 
 
 # ── Report endpoints ──────────────────────────────────────────────────────────
@@ -385,6 +527,9 @@ async def send_weekly_digest(authorization: Optional[str] = Header(default=None)
     for recruiter_id in recruiter_ids:
         recruiter = await users_col().find_one({"user_id": recruiter_id})
         if not recruiter or not recruiter.get("email"):
+            skipped += 1
+            continue
+        if recruiter.get("weekly_digest_enabled", True) is False:
             skipped += 1
             continue
 
